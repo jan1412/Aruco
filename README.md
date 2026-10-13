@@ -14,8 +14,17 @@ Python-Umgebung installieren:
 python -m pip install -r requirements.txt
 ```
 
-`opencv-contrib-python` enthält die benötigten ArUco/ChArUco-Funktionen.
-Nicht mehrere OpenCV-Paketvarianten in derselben Umgebung installieren.
+`requirements.txt` legt die getestete Paketversion
+`opencv-contrib-python==4.14.0.94` fest; `cv2.__version__` zeigt dafür
+`4.14.0` an. Für die Einzelinstallation von OpenCV:
+
+```sh
+python -m pip install "opencv-contrib-python==4.14.0.94"
+```
+
+Das [Contrib-Paket](https://pypi.org/project/opencv-contrib-python/4.14.0.94/)
+enthält die benötigten ArUco/ChArUco-Funktionen. Nur eine OpenCV-Paketvariante
+pro Umgebung installieren, da alle den `cv2`-Namensraum verwenden.
 
 ## Kamerakalibrierung
 

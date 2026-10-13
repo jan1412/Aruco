@@ -1,3 +1,7 @@
+# Alle Abhaengigkeiten installieren:
+# python -m pip install -r requirements.txt
+# OpenCV einzeln installieren (getestete Paketversion; cv2.__version__: 4.14.0):
+# python -m pip install "opencv-contrib-python==4.14.0.94"
 numpy>=1.23,<3
-opencv-contrib-python>=4.10,<5
+opencv-contrib-python==4.14.0.94
 scipy>=1.10,<2
