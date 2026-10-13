@@ -5,6 +5,11 @@ zu einer Referenzebene. Messmarker werden als parallel zur Referenzebene
 modelliert. Die Ausgabe umfasst CSV, JSON, Textberichte und optional Bilder
 mit eingezeichneten Markern.
 
+Neue Funktionen: gemeinsame parallele Messebenen, bekannte Hoehenkontrollen,
+Referenzmarker auf verschiedenen Hoehen, robuste Messoptimierung und raeumliche
+Kalibrierungsindikatoren. Der [Optimierungs-Guide](OPTIMIERUNGEN.md) beschreibt
+die Funktionen, benoetigte Masse, Einstellungen und aktive Aufnahmeschritte.
+
 ## Installation
 
 Python 3.10 oder neuer verwenden und die Abhängigkeiten in einer eigenen
@@ -59,6 +64,10 @@ Die zweite Erkennung nutzt vorläufige Kameraparameter. Mit `--reject-outliers`
 lassen sich begrenzt auffällige Aufnahmen entfernen; alle Entfernungen werden
 dokumentiert. `--validation-images` erlaubt die Reprojektionsprüfung mit
 separaten Aufnahmen. `--capture` bietet eine Webcam-Aufnahmefunktion.
+Jeder Lauf erzeugt `spatial_quality.png`, CSV und JSON mit lokalen
+Aufnahmehinweisen. Mit separaten Pruefbildern entsteht eine zusaetzliche
+Validierungskarte. `--model compare --validation-images PRUEFBILDER` vergleicht
+das Standardmodell und ein Modell mit festem `k3=0` auf denselben Pruefecken.
 
 ## Höhenmessung
 
@@ -127,6 +136,8 @@ python -m unittest -v
 Die Tests verwenden künstliche Posen, Kameraparameter und Geometrien. Sie prüfen
 bekannte Höhen, Posekorrektur, Qualitätsverwerfung, Auflösungsprüfung sowie
 eine frei gewählte ChArUco-Boarddefinition und deren Kalibrierexport.
+Weitere Tests pruefen gemeinsame Messebenen, nicht-koplanare Referenzen,
+Kontrolloffsets, Fehlerverwerfung, raeumliche Indikatoren und Modellvergleich.
 
 Technische Grundlage:
 [OpenCV ChArUco](https://docs.opencv.org/4.x/df/d4a/tutorial_charuco_detection.html),

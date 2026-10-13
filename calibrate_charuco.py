@@ -40,7 +40,9 @@ except ImportError as exc:
     raise SystemExit("Abhaengigkeiten fehlen: python -m pip install -r requirements.txt") from exc
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-VERSION = "1.1.0"
+from calibration_spatial import compute_spatial_quality, spatial_options, write_spatial_outputs
+
+VERSION = "1.2.0"
 
 
 def calibrated_detection_supported():
@@ -176,10 +178,13 @@ def collect_views(paths, board, detector, min_corners, expected_size=None, debug
     return views, rows, image_size
 
 
-def fit_camera(views, image_size):
+def fit_camera(views, image_size, model="standard"):
+    if model not in ("standard", "fix_k3"):
+        raise ValueError("Unbekanntes Kalibrierungsmodell.")
+    flags = cv2.CALIB_FIX_K3 if model == "fix_k3" else 0
     result = cv2.calibrateCameraExtended(
         [v.objects for v in views], [v.points for v in views], image_size,
-        None, None, flags=0,
+        None, None, flags=flags,
         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-9))
     rms, matrix, distortion, rvecs, tvecs, std_intr, _, per_view = result
     if not all(np.isfinite(a).all() for a in (rms, matrix, distortion, std_intr, per_view)):
@@ -188,7 +193,7 @@ def fit_camera(views, image_size):
         raise RuntimeError("Ungueltige Brennweiten. Mehr geneigte und unterschiedlich positionierte Bilder aufnehmen.")
     return {"rms": float(rms), "matrix": matrix, "distortion": distortion,
             "rvecs": rvecs, "tvecs": tvecs, "std_intr": std_intr.reshape(-1),
-            "per_view": per_view.reshape(-1)}
+            "per_view": per_view.reshape(-1), "model": model, "flags": flags}
 
 
 def outlier_limit(errors, minimum_limit):
@@ -211,7 +216,7 @@ def remove_outliers(views, image_size, fit, min_images, minimum_limit):
         history.append({"file": str(removed.path), "rms_px_before_removal": error, "threshold_px": limit})
         print(f"Ausreisser entfernt: {removed.path.name}, RMS {error:.3f} px (Schwelle {limit:.3f} px)")
         views = views[:worst] + views[worst+1:]
-        fit = fit_camera(views, image_size)
+        fit = fit_camera(views, image_size, fit.get("model", "standard"))
     return views, fit, history
 
 
@@ -261,15 +266,19 @@ def quality_summary(views, image_size, fit, minimum_limit):
             "note": "Heuristische Diagnosen. Ein kleiner Pixel-RMS belegt keine Hoehengenauigkeit in Millimetern."}
 
 
-def validate_images(paths, board, fit, size, min_corners, training_paths):
+def validate_images(paths, board, fit, size, min_corners, training_paths, spatial=None, cached=None):
     training_hashes = set()
     for path in training_paths:
         image = read_image(path)
         if image is not None:
             training_hashes.add(hashlib.sha256(image.tobytes()).digest())
-    views, rows, _ = collect_views(paths, board, make_detector(board, fit["matrix"], fit["distortion"]),
-                                   min_corners, expected_size=size)
-    errors, count = [], 0
+    if cached is None:
+        views, rows, _ = collect_views(paths, board, make_detector(board, fit["matrix"], fit["distortion"]),
+                                       min_corners, expected_size=size)
+    else:
+        views, rows = cached
+        rows = [dict(row) for row in rows]
+    errors, count, accepted, rvecs, tvecs = [], 0, [], [], []
     for view in views:
         image = read_image(view.path)
         if image is None:
@@ -286,9 +295,16 @@ def validate_images(paths, board, fit, size, min_corners, training_paths):
         rms = float(np.sqrt(np.mean(squared)))
         errors.extend(squared.tolist())
         count += 1
+        accepted.append(view)
+        rvecs.append(rvec)
+        tvecs.append(tvec)
         row.update(status="validated", rms_px=rms)
-    return {"images_used": count, "rms_px": float(np.sqrt(np.mean(errors))) if errors else None,
-            "views": rows, "note": "Intrinsische Parameter fixiert; pro Bild Pose angepasst. Kein Test der metrischen Hoehengenauigkeit."}
+    report = {"images_used": count, "rms_px": float(np.sqrt(np.mean(errors))) if errors else None,
+              "views": rows, "note": "Intrinsische Parameter fixiert; pro Bild Pose angepasst. Kein Test der metrischen Hoehengenauigkeit."}
+    report["spatial_quality"] = compute_spatial_quality(accepted, size,
+        dict(matrix=fit["matrix"], distortion=fit["distortion"], rvecs=rvecs, tvecs=tvecs),
+        source="validation", **(spatial or {}))
+    return report
 
 
 def write_csv(path, rows):
@@ -301,6 +317,10 @@ def write_csv(path, rows):
 
 def save_calibration(output, board, fit, size, views, rows, args, quality, history, validation):
     matrix, distortion = fit["matrix"], fit["distortion"]
+    spatial_report = compute_spatial_quality(views, size, fit, **spatial_options(args))
+    write_spatial_outputs(output, spatial_report)
+    if validation is not None:
+        write_spatial_outputs(output, validation["spatial_quality"], "validation_spatial_quality")
     np.savez_compressed(output / "camera_calibration.npz", camera_matrix=matrix,
                         dist_coeffs=distortion, image_size=np.array(size, dtype=np.int32),
                         rms_px=np.array(fit["rms"]))
@@ -315,7 +335,8 @@ def save_calibration(output, board, fit, size, views, rows, args, quality, histo
                       "marker_length_m": args.marker_mm / 1000, "dictionary": args.dictionary,
                       "marker_ids": board.getIds().reshape(-1).tolist(),
                       "charuco_corners": len(board.getChessboardCorners())},
-            "rms_px": fit["rms"], "images_used": len(views), "calibration_flags": 0,
+            "rms_px": fit["rms"], "images_used": len(views), "calibration_flags": fit.get("flags", 0),
+            "calibration_model": fit.get("model", "standard"), "spatial_quality": spatial_report,
             "detector_parameters": {"perspectiveRemovePixelPerCell": DETEKTOR_PIXEL_PRO_ZELLE,
                                     "markerBorderBits": 1, "cornerRefinementMethod": "CORNER_REFINE_NONE"},
             "intrinsic_std_deviations": fit["std_intr"].tolist(),
@@ -359,6 +380,11 @@ def save_calibration(output, board, fit, size, views, rows, args, quality, histo
              "Kameramodus, Objektiv, Fokus, Zoom, Crop und Aufloesung muessen zur Messung passen."]
     if validation is not None:
         lines.append(f"Separate Validierung: {validation['images_used']} Bilder; RMS {validation['rms_px']} px")
+    lines.extend(["", "Raeumlicher Aufnahmeindikator: spatial_quality.png / .csv / .json",
+                  "Zeilen von oben nach unten, Spalten von links nach rechts; Originalpixel."])
+    for cell in spatial_report["cells"]:
+        if cell["status"] != "observed":
+            lines.append(f"  R{cell['row']} C{cell['column']}: " + " ".join(cell["recommendations"]))
     (output / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -445,11 +471,25 @@ def parse_args(argv=None):
     parser.add_argument("--reject-outliers", action="store_true", help="Optional maximal 10%% / drei Ausreisserbilder entfernen")
     parser.add_argument("--outlier-px", type=float, default=1.0, help="Untere Ausreisserschwelle in Pixeln (Standard: 1.0)")
     parser.add_argument("--validation-images", type=Path, help="Separater Ordner neuer Boardbilder fuer Reprojektionspruefung")
+    parser.add_argument("--model", choices=("standard", "fix_k3", "compare"), default="standard",
+                        help="5 Parameter, k3=0, oder Auswahl anhand separater Validierung")
+    parser.add_argument("--spatial-grid", type=int, nargs=2, default=(6, 4), metavar=("SPALTEN", "ZEILEN"))
+    parser.add_argument("--spatial-min-views", type=int, default=3)
+    parser.add_argument("--spatial-min-corners", type=int, default=12)
+    parser.add_argument("--spatial-min-tilt-span", type=float, default=10.)
+    parser.add_argument("--spatial-max-rms-px", type=float, default=1.)
     parser.add_argument("--capture", action="store_true", help="Vorher Bilder direkt von einer Kamera aufnehmen (GUI erforderlich)")
     parser.add_argument("--camera", type=int, default=0, help="Kameraindex fuer --capture")
     parser.add_argument("--width", type=int, help="Gewuenschte Kamera-Aufnahmebreite fuer --capture")
     parser.add_argument("--height", type=int, help="Gewuenschte Kamera-Aufnahmehoehe fuer --capture")
     args = parser.parse_args(argv)
+    if args.model == "compare" and args.validation_images is None:
+        parser.error("model=compare benoetigt separate validation-images.")
+    if (any(not 1 <= n <= 20 for n in args.spatial_grid) or args.spatial_min_views < 1
+            or args.spatial_min_corners < 1 or not math.isfinite(args.spatial_min_tilt_span)
+            or not 0 <= args.spatial_min_tilt_span <= 180
+            or not math.isfinite(args.spatial_max_rms_px) or args.spatial_max_rms_px <= 0):
+        parser.error("Ungueltige Grenzen fuer den Raumindikator.")
     if not (0 < args.marker_mm < args.square_mm and math.isfinite(args.square_mm)):
         parser.error("Es muss 0 < marker-mm < square-mm gelten; beide Werte muessen endlich sein.")
     if args.squares_x < 3 or args.squares_y < 3:
@@ -493,7 +533,8 @@ def main(argv=None):
     if len(views) < args.min_images:
         raise RuntimeError(f"Nur {len(views)} geeignete Bilder, mindestens {args.min_images} erforderlich. "
                            "initial_detection_report.csv pruefen; weitere geneigte Aufnahmen erstellen.")
-    fit = fit_camera(views, size)
+    training_model = "fix_k3" if args.model == "fix_k3" else "standard"
+    fit = fit_camera(views, size, training_model)
     initial_rms = fit["rms"]
     if not args.single_pass:
         print(f"Vorlaeufiger RMS {initial_rms:.4f} px. Zweite Erkennung mit Kameraparametern ...")
@@ -508,21 +549,42 @@ def main(argv=None):
         write_csv(args.output / "image_report.csv", rows)
         if len(refined) < args.min_images:
             raise RuntimeError("Zweite Erkennung hat zu wenige geeignete Bilder. Berichte pruefen und Aufnahmen verbessern.")
-        views, fit = refined, fit_camera(refined, size)
+        views, fit = refined, fit_camera(refined, size, training_model)
     before_filter_rms = fit["rms"]
     history = []
     if args.reject_outliers:
         views, fit, history = remove_outliers(views, size, fit, args.min_images, args.outlier_px)
-    quality = quality_summary(views, size, fit, args.outlier_px)
-    quality.update(initial_pass_rms_px=initial_rms, before_outlier_removal_rms_px=before_filter_rms)
     validation = None
     if args.validation_images is not None:
         validation_paths = find_images(args.validation_images.resolve(), args.recursive)
         if not validation_paths:
             raise RuntimeError("Validierungsordner enthaelt keine Bilder.")
-        validation = validate_images(validation_paths, board, fit, size, args.min_corners, set(paths))
+        cached_views, cached_rows, _ = collect_views(validation_paths, board,
+            make_detector(board, fit["matrix"], fit["distortion"]), args.min_corners, expected_size=size)
+        candidates = []
+        for model in (("standard", "fix_k3") if args.model == "compare" else (training_model,)):
+            candidate = fit if model == training_model else fit_camera(views, size, model)
+            checked = validate_images(validation_paths, board, candidate, size, args.min_corners,
+                                      set(paths), spatial_options(args), (cached_views, cached_rows))
+            if checked["images_used"] == 0:
+                raise RuntimeError("Kein geeignetes Validierungsbild gefunden; Ordner / Board pruefen.")
+            if args.model == "compare" and checked["images_used"] != len(cached_views):
+                raise RuntimeError("Modellvergleich braucht erfolgreiche Posen fuer dieselben Pruefaufnahmen.")
+            candidates.append((candidate, checked))
+        fit, validation = min(candidates, key=lambda pair: pair[1]["rms_px"])
+        if args.model == "compare":
+            comparison = dict(selected_model=fit["model"], selection="lowest_validation_rms_px",
+                note="Gleiche Trainingsbilder und gleiche Validierungs-Bildecken fuer beide Modelle. "
+                     "Die zur Auswahl genutzte Validierung ist kein unabhaengiger Abschlusstest.",
+                candidates=[dict(model=candidate["model"], training_rms_px=candidate["rms"],
+                                 validation_rms_px=checked["rms_px"], images=checked["images_used"])
+                            for candidate, checked in candidates])
+            (args.output / "model_comparison.json").write_text(json.dumps(comparison, indent=2), encoding="utf-8")
+            print("Modell anhand separater Aufnahmen ausgewaehlt:", fit["model"])
         if validation["images_used"] == 0:
             raise RuntimeError("Kein geeignetes Validierungsbild gefunden; Ordner / Board pruefen.")
+    quality = quality_summary(views, size, fit, args.outlier_px)
+    quality.update(initial_pass_rms_px=initial_rms, before_outlier_removal_rms_px=before_filter_rms)
     save_calibration(args.output, board, fit, size, views, rows, args, quality, history, validation)
     print(f"\nFertig: {len(views)} Bilder; RMS {fit['rms']:.4f} px; Ausgabe: {args.output}")
     print("Kameramatrix:\n", fit["matrix"])

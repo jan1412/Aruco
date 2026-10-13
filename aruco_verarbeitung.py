@@ -53,6 +53,7 @@ an die vier Bildecken an. Jeder Messmarker erhält eine eigene lokale Höhe.
 from __future__ import annotations
 
 import copy
+import argparse
 import csv
 import glob
 import json
@@ -109,6 +110,20 @@ CONFIG = {'REFERENZBILD': None,
  'GEOMETRIE_MAX_ABWEICHUNG_MM': 0.5,
  'REFERENZ_WINKEL_GRAD': {},
  'REFERENZ_EBENENVERSATZ_MM': 0.0,
+ 'REFERENZ_HOEHEN_MM': {},
+ 'MESSMODELL': 'einzelmarker',
+ 'MESSGRUPPEN': {},
+ 'MIN_MARKER_PRO_MESSEBENE': 2,
+ 'MESSEBENE_MAX_EINZELHOEHENSPANNE_MM': None,
+ 'MESS_OPTIMIERUNG_LOSS': 'linear',
+ 'MESS_ROBUST_SKALA_PX': 1.0,
+ 'HOEHENREFERENZEN_MM': {},
+ 'HOEHENREFERENZ_MAX_FEHLER_MM': None,
+ 'KONTROLLKORREKTUR_MODUS': 'aus',
+ 'KONTROLLKORREKTUR_IDS': [],
+ 'KONTROLLKORREKTUR_MIN_MARKER': 1,
+ 'KONTROLLKORREKTUR_MAX_SPANNE_MM': 0.5,
+ 'KONTROLLKORREKTUR_MAX_OFFSET_MM': None,
  'REFERENZPOSE_MODUS': 'pro_bild',
  'MIN_REFERENZMARKER': 3,
  'REF_KONTROLLE_MAX_RMS_PX': 1.5,
@@ -123,7 +138,7 @@ CONFIG = {'REFERENZBILD': None,
  'CSV_DEZIMALKOMMA': True}
 # ===================== ENDE KONFIGURATION =====================
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -198,6 +213,11 @@ def dictionary_object(name):
 
 
 def build_specs(config):
+    known_heights = config.get("HOEHENREFERENZEN_MM", {})
+    if set(known_heights) - set(config["MESS_IDS"]):
+        raise ProcessingError("HOEHENREFERENZEN_MM muss IDs aus MESS_IDS verwenden.")
+    for marker_id, height in known_heights.items():
+        finite_number(height, f"HOEHENREFERENZEN_MM[{marker_id}]")
     specs = []
     for prefix, role in (("REFERENZ", "reference"), ("MESS", "measurement")):
         ids = config[prefix + "_IDS"]
@@ -215,7 +235,8 @@ def build_specs(config):
             dictionary = dictionary_object(name)
             if marker_id >= len(dictionary.bytesList):
                 raise ProcessingError(f"ID {marker_id} existiert nicht in {name}.")
-            specs.append(MarkerSpec(marker_id, name, size, role))
+            marker_role = "height_control" if role == "measurement" and marker_id in known_heights else role
+            specs.append(MarkerSpec(marker_id, name, size, marker_role))
     if len({s.key for s in specs}) != len(specs):
         raise ProcessingError("Dieselbe Kombination aus Bibliothek und ID hat mehrere Rollen.")
     if config["REFERENZPOSE_MODUS"] not in ("fest", "pro_bild"):
@@ -237,6 +258,51 @@ def build_specs(config):
         raise ProcessingError("NULL_OFFSETS_MM enthält unbekannte Messmarker-IDs.")
     for marker_id, value in config["NULL_OFFSETS_MM"].items():
         finite_number(value, f"NULL_OFFSETS_MM[{marker_id}]")
+    if set(config["NULL_OFFSETS_MM"]) & set(known_heights):
+        raise ProcessingError("Hoehenkontrollen verwenden die Grundebene, keine NULL_OFFSETS_MM.")
+    heights = config.get("REFERENZ_HOEHEN_MM", {})
+    if set(heights) - set(config["REFERENZ_IDS"]):
+        raise ProcessingError("REFERENZ_HOEHEN_MM enthaelt unbekannte Referenz-IDs.")
+    for marker_id, height in heights.items():
+        finite_number(height, f"REFERENZ_HOEHEN_MM[{marker_id}]")
+    if heights and config["REFERENZ_LAYOUT_MODUS"] == "abstaende":
+        raise ProcessingError("Erhoehte Referenzen brauchen gerichtete X/Y-Positionen oder ein vermessenes Raster.")
+    if config.get("MESSMODELL", "einzelmarker") not in ("einzelmarker", "gemeinsame_ebene"):
+        raise ProcessingError("MESSMODELL muss einzelmarker oder gemeinsame_ebene sein.")
+    targets = {s.marker_id for s in specs if s.role == "measurement"}
+    if not targets:
+        raise ProcessingError("Mindestens ein Messmarker ohne bekannte Kontrollhoehe erforderlich.")
+    groups, used = config.get("MESSGRUPPEN", {}), set()
+    for name, ids in groups.items():
+        if (not isinstance(name, str) or not name or not isinstance(ids, (list, tuple))
+                or len(ids) < 2 or any(type(i) is not int for i in ids)
+                or len(set(ids)) != len(ids) or set(ids) - targets or used & set(ids)):
+            raise ProcessingError("MESSGRUPPEN brauchen eindeutige Namen und disjunkte Gruppen aus mindestens zwei Mess-IDs.")
+        used.update(ids)
+    if config.get("MESSMODELL") == "gemeinsame_ebene" and not groups:
+        raise ProcessingError("Gemeinsame Messebene benoetigt ausdrueckliche MESSGRUPPEN.")
+    minimum_group = config.get("MIN_MARKER_PRO_MESSEBENE", 2)
+    if (type(minimum_group) is not int or minimum_group < 2
+            or any(len(ids) < minimum_group for ids in groups.values())):
+        raise ProcessingError("MIN_MARKER_PRO_MESSEBENE passt nicht zu den Gruppen.")
+    if config.get("MESS_OPTIMIERUNG_LOSS", "linear") not in ("linear", "soft_l1", "huber"):
+        raise ProcessingError("MESS_OPTIMIERUNG_LOSS: linear, soft_l1 oder huber verwenden.")
+    finite_number(config.get("MESS_ROBUST_SKALA_PX", 1.), "MESS_ROBUST_SKALA_PX", positive=True)
+    for key in ("MESSEBENE_MAX_EINZELHOEHENSPANNE_MM", "HOEHENREFERENZ_MAX_FEHLER_MM",
+                "KONTROLLKORREKTUR_MAX_SPANNE_MM", "KONTROLLKORREKTUR_MAX_OFFSET_MM"):
+        if config.get(key) is not None:
+            finite_number(config[key], key, positive=True)
+    if config.get("KONTROLLKORREKTUR_MODUS", "aus") not in ("aus", "offset"):
+        raise ProcessingError("KONTROLLKORREKTUR_MODUS muss aus oder offset sein.")
+    control_ids = config.get("KONTROLLKORREKTUR_IDS", [])
+    if (any(type(i) is not int for i in control_ids) or len(set(control_ids)) != len(control_ids)
+            or set(control_ids) - set(known_heights)):
+        raise ProcessingError("KONTROLLKORREKTUR_IDS muss eindeutige Hoehenkontroll-IDs enthalten.")
+    minimum_control = config.get("KONTROLLKORREKTUR_MIN_MARKER", 1)
+    if type(minimum_control) is not int or minimum_control < 1:
+        raise ProcessingError("KONTROLLKORREKTUR_MIN_MARKER muss positiv sein.")
+    if config.get("KONTROLLKORREKTUR_MODUS") == "offset" and len(control_ids) < minimum_control:
+        raise ProcessingError("Offsetkorrektur braucht ausreichend ausdruecklich gewaehlte Kontroll-IDs.")
     return specs
 
 
@@ -368,7 +434,9 @@ def build_reference_geometry(config, specs):
         if spec.marker_id not in config["REFERENZ_WINKEL_GRAD"]:
             raise ProcessingError(f"Referenzwinkel für ID {spec.marker_id} fehlt.")
         angle = finite_number(config["REFERENZ_WINKEL_GRAD"][spec.marker_id], "Referenzwinkel")
-        center = np.r_[positions[spec.marker_id], z]
+        marker_z = finite_number(config.get("REFERENZ_HOEHEN_MM", {}).get(spec.marker_id, z),
+                                 f"Referenzhoehe {spec.marker_id}")
+        center = np.r_[positions[spec.marker_id], marker_z]
         corners = square_corners(spec.size_mm) @ rotation_z(math.radians(angle)).T + center
         geometry[spec.key] = corners
         details.append({"dictionary": spec.dictionary, "id": spec.marker_id,
@@ -576,7 +644,10 @@ def estimate_reference_pose(observations, geometry, K, D, config, source, enforc
     ids, points, pixels = reference_correspondences(observations, geometry)
     if len(ids) < config["MIN_REFERENZMARKER"]:
         raise ProcessingError(f"Referenzpose braucht mindestens {config['MIN_REFERENZMARKER']} Marker; erkannt: {len(ids)}.")
-    candidates = pnp_candidates(points, pixels, K, D, cv2.SOLVEPNP_IPPE, refine=True)
+    singular = np.linalg.svd(points - points.mean(axis=0), compute_uv=False)
+    planar = singular[-1] <= max(singular[0], 1.) * 1e-8
+    candidates = pnp_candidates(points, pixels, K, D,
+                               cv2.SOLVEPNP_IPPE if planar else cv2.SOLVEPNP_SQPNP, refine=True)
     for rms, rvec, tvec in candidates:
         R = cv2.Rodrigues(rvec)[0]
         center_camera = R @ points.mean(axis=0) + tvec.reshape(3)
@@ -613,7 +684,7 @@ def apply_reference_quality(records, control, config):
     except ProcessingError as exc:
         message = str(exc)
         for record in records:
-            if record["role"] != "measurement":
+            if record["role"] not in ("measurement", "height_control"):
                 continue
             if "height_mm" in record:
                 record["diagnostic_height_mm"] = record.pop("height_mm")
@@ -654,7 +725,9 @@ def fit_parallel_marker(observation, spec, pose, K, D, config, candidates):
         center = R_ground_camera.T @ (tvec.reshape(3) - t_ground_camera)
         relative_rotation = R_ground_camera.T @ cv2.Rodrigues(rvec)[0]
         psi = math.atan2(relative_rotation[1, 0], relative_rotation[0, 0])
-        fit = least_squares(residual, np.r_[center, psi], method="trf", x_scale="jac")
+        fit = least_squares(residual, np.r_[center, psi], method="trf", x_scale="jac",
+                            loss=config.get("MESS_OPTIMIERUNG_LOSS", "linear"),
+                            f_scale=config.get("MESS_ROBUST_SKALA_PX", 1.))
         if not fit.success or not np.isfinite(fit.x).all():
             continue
         camera_points = points_in_ground(fit.x) @ R_ground_camera.T + t_ground_camera
@@ -687,13 +760,143 @@ def analyze_observations(observations, spec_map, pose, K, D, config):
         else:
             try:
                 record["free_pose"], candidates = free_marker_pose(observation, spec, K, D, pose)
-                if spec.role == "measurement":
+                if spec.role in ("measurement", "height_control"):
                     record.update(fit_parallel_marker(observation, spec, pose, K, D, config, candidates))
                 record["status"] = "ok"
             except (ProcessingError, cv2.error, RuntimeError) as exc:
                 record.update(status="error", error=str(exc))
         records.append(record)
     return records
+
+
+def invalidate_heights(records, message):
+    for record in records:
+        if "height_mm" in record:
+            record["diagnostic_height_mm"] = record.pop("height_mm")
+        record.update(status="error", error=message)
+
+
+def fit_measurement_planes(records, spec_map, pose, K, D, config):
+    """Fit one common z and independent x/y/yaw values using all group corners."""
+    if config.get("MESSMODELL", "einzelmarker") == "einzelmarker":
+        return []
+    reports = []
+    for name, ids in config["MESSGRUPPEN"].items():
+        present = [r for r in records if r["role"] == "measurement" and r["id"] in ids]
+        members = [r for r in present if r["status"] == "ok"]
+        report = dict(name=name, configured_ids=list(ids), used_ids=[r["id"] for r in members],
+                      normal_ground=[0., 0., 1.], status="error")
+        reports.append(report)
+        for record in present:
+            record["measurement_plane"] = name
+            if "height_raw_mm" in record:
+                record["individual_height_raw_mm"] = record["height_raw_mm"]
+        try:
+            if len(members) < config.get("MIN_MARKER_PRO_MESSEBENE", 2):
+                raise ProcessingError(f"Messebene {name}: zu wenige gueltige Marker.")
+            individual = [r["height_raw_mm"] for r in members]
+            span = float(np.ptp(individual))
+            report["individual_height_span_mm"] = span
+            check_limit(span, config.get("MESSEBENE_MAX_EINZELHOEHENSPANNE_MM"), "Einzelhoehen einer Messebene")
+            initial = [float(np.median(individual))]
+            locals_ = []
+            for record in members:
+                center = record["position_ground_mm"]
+                initial.extend([center[0], center[1], math.radians(record["rotation_in_ground_plane_deg"])])
+                locals_.append(square_corners(spec_map[(record["dictionary"], record["id"])].size_mm))
+
+            def corners(parameters, index):
+                x, y, psi = parameters[1 + 3*index:4 + 3*index]
+                return locals_[index] @ rotation_z(psi).T + np.array([x, y, parameters[0]])
+
+            def residual(parameters):
+                return np.concatenate([(project(corners(parameters, i), pose.rvec, pose.tvec, K, D)
+                                        - record["corners_px"]).ravel() for i, record in enumerate(members)])
+
+            fit = least_squares(residual, initial, method="trf", x_scale="jac",
+                                loss=config.get("MESS_OPTIMIERUNG_LOSS", "linear"),
+                                f_scale=config.get("MESS_ROBUST_SKALA_PX", 1.))
+            if not fit.success or not np.isfinite(fit.x).all():
+                raise ProcessingError("Gemeinsame Ebenenoptimierung fehlgeschlagen.")
+            errors = residual(fit.x).reshape(len(members), 4, 2)
+            rms_values = np.sqrt(np.mean(np.sum(errors ** 2, axis=2), axis=1))
+            for index, rms in enumerate(rms_values):
+                camera_points = corners(fit.x, index) @ pose.R.T + pose.tvec.reshape(3)
+                if np.any(camera_points[:, 2] <= 0):
+                    raise ProcessingError("Messebene liegt hinter der Kamera.")
+                check_limit(float(rms), config["MESS_MAX_RMS_PX"], f"Messebene {name}, ID {members[index]['id']}")
+            for index, record in enumerate(members):
+                x, y, psi = fit.x[1 + 3*index:4 + 3*index]
+                center = np.array([x, y, fit.x[0]])
+                record.update(position_ground_mm=center, height_raw_mm=float(fit.x[0]),
+                    height_mm=float(fit.x[0] - record["zero_mm"]),
+                    rotation_in_ground_plane_deg=(math.degrees(psi)+180) % 360-180,
+                    reprojection_rms_px=float(rms_values[index]),
+                    rvec_marker_to_camera=cv2.Rodrigues(pose.R @ rotation_z(psi))[0].reshape(3),
+                    tvec_marker_to_camera_mm=pose.R @ center + pose.tvec.reshape(3))
+            report.update(status="ok", height_raw_mm=float(fit.x[0]),
+                          reprojection_rms_px=float(np.sqrt(np.mean(np.sum(errors ** 2, axis=2)))))
+        except (ProcessingError, cv2.error, RuntimeError, ValueError) as exc:
+            report["error"] = str(exc)
+            invalidate_heights(present, str(exc))
+    return reports
+
+
+def initialize_height_controls(records, config):
+    for record in records:
+        if record["role"] == "height_control" and record["status"] == "ok":
+            known = float(config["HOEHENREFERENZEN_MM"][record["id"]])
+            record.update(known_height_mm=known, height_mm=record["height_raw_mm"],
+                          zero_mm=0., zero_source="ground_plane",
+                          height_error_before_correction_mm=record["height_raw_mm"] - known)
+
+
+def apply_height_controls(records, config):
+    controls = [r for r in records if r["role"] == "height_control" and r["status"] == "ok"]
+    targets = [r for r in records if r["role"] == "measurement"]
+    selected = set(config.get("KONTROLLKORREKTUR_IDS", []))
+    used = [r for r in controls if r["id"] in selected]
+    correction = dict(mode=config.get("KONTROLLKORREKTUR_MODUS", "aus"), offset_mm=0.,
+                      used_ids=[], status="off")
+    try:
+        if correction["mode"] == "offset":
+            if len(used) < config.get("KONTROLLKORREKTUR_MIN_MARKER", 1):
+                raise ProcessingError("Offsetkorrektur: zu wenige gueltige Hoehenkontrollen.")
+            errors = [r["height_error_before_correction_mm"] for r in used]
+            check_limit(float(np.ptp(errors)), config.get("KONTROLLKORREKTUR_MAX_SPANNE_MM"),
+                        "Streuung der Kontrolloffsets")
+            offset = float(np.median(errors))
+            check_limit(abs(offset), config.get("KONTROLLKORREKTUR_MAX_OFFSET_MM"), "Kontrolloffset")
+            correction.update(status="ok", offset_mm=offset, used_ids=[r["id"] for r in used])
+            for record in targets + controls:
+                if record["status"] == "ok" and "height_mm" in record:
+                    record["height_before_control_correction_mm"] = record["height_mm"]
+                    record["height_mm"] -= offset
+                    record["control_offset_mm"] = offset
+        for record in controls:
+            record["used_for_control_correction"] = record["id"] in correction["used_ids"]
+            record["height_error_mm"] = record["height_mm"] - record["known_height_mm"]
+            check_limit(abs(record["height_error_mm"]), config.get("HOEHENREFERENZ_MAX_FEHLER_MM"),
+                        f"Hoehenkontrolle ID {record['id']}")
+    except ProcessingError as exc:
+        correction.update(status="error", error=str(exc))
+        invalidate_heights(targets + controls, str(exc))
+    return correction
+
+
+def finalize_plane_reports(planes, records):
+    for plane in planes:
+        members = [r for r in records if r.get("measurement_plane") == plane["name"]
+                   and r["id"] in plane["used_ids"]]
+        if plane["status"] == "ok" and members and all(r["status"] == "ok" for r in members):
+            heights = [r["height_mm"] for r in members]
+            plane["height_mm"] = float(np.mean(heights)) if np.ptp(heights) < 1e-9 else None
+            plane["height_note"] = "Gemeinsame korrigierte Hoehe" if plane["height_mm"] is not None else "Verschiedene Nullhoehen: siehe Markerwerte."
+        else:
+            plane["status"] = "error"
+            if "height_raw_mm" in plane:
+                plane["diagnostic_height_raw_mm"] = plane.pop("height_raw_mm")
+            plane.pop("height_mm", None)
 
 
 def zero_levels(config, specs, reference_records):
@@ -794,6 +997,10 @@ def write_frame_outputs(directory, prefix, report, image, K, D, config):
         for label in ("T_ground_to_camera", "T_camera_to_ground"):
             lines.extend([label + ":", np.array2string(np.asarray(report["reference_pose"][label]), precision=6)])
     lines.append("Referenzkontrolle: " + str(report.get("reference_control")))
+    if report.get("measurement_planes"):
+        lines.append("Gemeinsame Messebenen: " + str(jsonable(report["measurement_planes"])))
+    if report.get("height_control"):
+        lines.append("Hoehenkontrolle / Offset: " + str(jsonable(report["height_control"])))
     for record in report.get("markers", []):
         lines.extend(["", f"{record['dictionary']} ID {record['id']} | {record['role']} | {record.get('status', 'unprocessed')}",
                       f"Kantenlaenge_mm: {record['size_mm']}", "Bildecken_px:"])
@@ -814,6 +1021,10 @@ def write_frame_outputs(directory, prefix, report, image, K, D, config):
                           f"Korrigierte_Hoehe_mm: {record['height_mm']:.6f}"])
         if "diagnostic_height_mm" in record:
             lines.append(f"Diagnostische_Hoehe_mm: {record['diagnostic_height_mm']:.6f} (UNGUELTIG)")
+        if "known_height_mm" in record:
+            lines.append(f"Bekannte_Hoehe_mm: {record['known_height_mm']:.6f}")
+        if "height_error_mm" in record:
+            lines.append(f"Kontrollabweichung_mm: {record['height_error_mm']:.6f}")
         if "error" in record:
             lines.append("Fehler: " + record["error"])
     (directory / f"{prefix}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -828,11 +1039,11 @@ def measurement_rows(report, specs):
     by_key = {(r["dictionary"], r["id"]): r for r in report.get("markers", [])}
     rows = []
     for spec in specs:
-        if spec.role != "measurement":
+        if spec.role not in ("measurement", "height_control"):
             continue
         record = by_key.get(spec.key)
         row = {"bild": str(report["image"]), "bibliothek": spec.dictionary, "id": spec.marker_id,
-               "groesse_mm": spec.size_mm, "status": "missing", "fehler": "Marker nicht erkannt"}
+               "rolle": spec.role, "groesse_mm": spec.size_mm, "status": "missing", "fehler": "Marker nicht erkannt"}
         if report["status"] == "error":
             row.update(status="error", fehler=report.get("error", "Aufnahme nicht auswertbar"))
         if record:
@@ -843,10 +1054,18 @@ def measurement_rows(report, specs):
             if "position_ground_mm" in record:
                 row.update(zip(("x_mm", "y_mm", "z_roh_mm"), record["position_ground_mm"]))
                 row.update(rms_px=record["reprojection_rms_px"], drehung_grad=record["rotation_in_ground_plane_deg"])
-            if "height_mm" in record:
+            if "height_mm" in record and row["status"] == "ok":
                 row.update(hoehe_mm=record["height_mm"], nullhoehe_mm=record["zero_mm"], nullquelle=record["zero_source"])
             if "diagnostic_height_mm" in record:
                 row["diagnostische_hoehe_mm"] = record["diagnostic_height_mm"]
+            for source, target in (("measurement_plane", "messebene"),
+                    ("individual_height_raw_mm", "einzelhoehe_roh_mm"),
+                    ("known_height_mm", "bekannte_hoehe_mm"), ("height_error_mm", "kontrollfehler_mm"),
+                    ("height_error_before_correction_mm", "kontrollfehler_vor_korrektur_mm"),
+                    ("control_offset_mm", "kontrolloffset_mm"),
+                    ("used_for_control_correction", "zur_korrektur_verwendet")):
+                if source in record:
+                    row[target] = record[source]
         if report.get("reference_pose"):
             row["referenzquelle"] = report["reference_pose"]["source"]
         row["referenz_rms_px"] = report.get("reference_control", {}).get("control_rms_px")
@@ -855,10 +1074,12 @@ def measurement_rows(report, specs):
     return rows
 
 
-def write_csv(path, rows, decimal_comma):
-    columns = ["bild", "bibliothek", "id", "groesse_mm", "status", "hoehe_mm", "x_mm", "y_mm",
+def write_csv(path, rows, decimal_comma, columns=None):
+    columns = columns or ["bild", "bibliothek", "id", "rolle", "groesse_mm", "status", "hoehe_mm", "x_mm", "y_mm",
                "z_roh_mm", "nullhoehe_mm", "nullquelle", "drehung_grad", "rms_px", "referenzquelle",
-               "referenz_rms_px", "diagnostische_hoehe_mm", "hinweise", "fehler"]
+               "referenz_rms_px", "diagnostische_hoehe_mm", "messebene", "einzelhoehe_roh_mm",
+               "bekannte_hoehe_mm", "kontrollfehler_mm", "kontrollfehler_vor_korrektur_mm",
+               "kontrolloffset_mm", "zur_korrektur_verwendet", "hinweise", "fehler"]
     def value(v):
         if isinstance(v, (float, np.floating)):
             text = f"{v:.6f}"
@@ -924,6 +1145,7 @@ def run_pipeline(config):
             logger.warning(warning)
         save_json(directory / "konfiguration.json", config)
         reference_records = analyze_observations(reference_observations, spec_map, base_pose, K, D, config)
+        initialize_height_controls(reference_records, config)
         levels = zero_levels(config, specs, reference_records)
         apply_zero_levels(reference_records, levels)
         reference_report = {"image": reference_path, "status": "reference", "reference_pose": base_pose.as_dict(),
@@ -947,8 +1169,14 @@ def run_pipeline(config):
                                                        enforce_quality=False)
                 report.update(reference_pose=pose.as_dict(), reference_control=control)
                 records = analyze_observations(observations, spec_map, pose, K, D, config)
+                initialize_height_controls(records, config)
                 apply_zero_levels(records, levels)
+                planes = fit_measurement_planes(records, spec_map, pose, K, D, config)
                 reference_error = apply_reference_quality(records, control, config)
+                height_control = (apply_height_controls(records, config) if not reference_error else
+                                  dict(status="blocked", error=reference_error))
+                finalize_plane_reports(planes, records)
+                report.update(measurement_planes=planes, height_control=height_control)
                 warning_limit = config.get("REF_KONTROLLE_WARN_RMS_PX")
                 if (warning_limit is not None and control["control_rms_px"] is not None
                         and control["control_rms_px"] > warning_limit):
@@ -961,12 +1189,16 @@ def run_pipeline(config):
                 valid = [r for r in seen_measurements if r["status"] == "ok"]
                 if reference_error:
                     report.update(status="error", error=reference_error)
+                elif height_control["status"] == "error":
+                    report.update(status="error", error=height_control["error"])
                 elif not seen_measurements:
                     report.update(status="no_measurements", error="Keine konfigurierten Messmarker erkannt.")
                 elif not valid:
                     report.update(status="error", error="Alle erkannten Messmarker sind nicht auswertbar.")
                 else:
-                    report["status"] = "ok" if len(valid) == expected_measurements else "partial"
+                    controls_seen = sum(r["role"] == "height_control" and r["status"] == "ok" for r in records)
+                    report["status"] = ("ok" if len(valid) == expected_measurements
+                        and controls_seen == len(config.get("HOEHENREFERENZEN_MM", {})) else "partial")
                 logger.info("%s | %s | %d gültige Höhen | Referenzquelle %s", path.name,
                             report["status"], len(valid), pose.source)
                 for record in valid:
@@ -983,6 +1215,14 @@ def run_pipeline(config):
             reports.append(report)
             rows.extend(measurement_rows(report, specs))
         write_csv(directory / "hoehen.csv", rows, config["CSV_DEZIMALKOMMA"])
+        plane_rows = [dict(bild=str(report["image"]), gruppe=plane["name"], status=plane["status"],
+            ids=",".join(str(i) for i in plane["used_ids"]), hoehe_mm=plane.get("height_mm"),
+            z_roh_mm=plane.get("height_raw_mm"), diagnostische_rohhoehe_mm=plane.get("diagnostic_height_raw_mm"),
+            rms_px=plane.get("reprojection_rms_px"), einzelhoehen_spanne_mm=plane.get("individual_height_span_mm"),
+            hinweise=plane.get("height_note", ""), fehler=plane.get("error", report.get("error", "")))
+            for report in reports for plane in report.get("measurement_planes", [])]
+        if plane_rows:
+            write_csv(directory / "messebene.csv", plane_rows, config["CSV_DEZIMALKOMMA"], list(plane_rows[0]))
         summary = {"version": VERSION, "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                    "run_directory": directory, "reference_pose_mode": config["REFERENZPOSE_MODUS"],
                    "calibration": {"K": K, "D": D, "image_size": image_size, "rms_px": calibration_rms,
@@ -992,7 +1232,8 @@ def run_pipeline(config):
                    "reference_geometry": geometry_details, "reference_pose": base_pose.as_dict(),
                    "zero_levels": [{"dictionary": key[0], "id": key[1], "zero_mm": v[0], "source": v[1]}
                                    for key, v in levels.items()],
-                   "images_total": len(reports), "valid_measurements": sum(r["status"] == "ok" for r in rows),
+                   "measurement_model": config.get("MESSMODELL", "einzelmarker"),
+                   "images_total": len(reports), "valid_measurements": sum(r["status"] == "ok" and r["rolle"] == "measurement" for r in rows),
                    "images_error": sum(r["status"] == "error" for r in reports),
                    "images_incomplete": sum(r["status"] != "ok" for r in reports),
                    "reports": reports}
@@ -1017,9 +1258,44 @@ def run_pipeline(config):
             handler.close()
 
 
-def main():
+def load_configuration(path):
+    """JSON overrides; ID-keyed maps and paths relative to the local config."""
+    path = Path(path).expanduser().resolve()
+    overrides = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(overrides, dict) or set(overrides) - set(CONFIG):
+        raise ProcessingError("Config muss ein JSON-Objekt mit bekannten CONFIG-Feldern sein.")
+    config = copy.deepcopy(CONFIG)
+    id_maps = {"REFERENZ_GROESSEN_MM", "MESS_GROESSEN_MM", "REFERENZ_DICTS", "MESS_DICTS",
+               "REFERENZ_POSITIONEN_MM", "REFERENZ_WINKEL_GRAD", "REFERENZ_HOEHEN_MM",
+               "NULL_OFFSETS_MM", "HOEHENREFERENZEN_MM"}
+    for key, value in overrides.items():
+        if key in id_maps:
+            if not isinstance(value, dict) or any(not str(i).isdigit() for i in value):
+                raise ProcessingError(f"{key}: JSON-Objekt mit nichtnegativen Marker-IDs erwartet.")
+            converted = {int(i): v for i, v in value.items()}
+            if len(converted) != len(value):
+                raise ProcessingError(f"{key}: mehrfach angegebene Marker-ID.")
+            value = converted
+        config[key] = value
+    for key in ("REFERENZBILD", "AUSGABEORDNER", "KAMERAMATRIX_DATEI", "VERZEICHNUNG_DATEI"):
+        if key in overrides and config[key] is not None:
+            value = Path(config[key]).expanduser()
+            config[key] = str(value if value.is_absolute() else path.parent / value)
+    if "MESSBILDER" in overrides:
+        entries = config["MESSBILDER"]
+        if not isinstance(entries, list) or any(not isinstance(v, str) for v in entries):
+            raise ProcessingError("MESSBILDER muss eine Liste von Pfaden/Globs sein.")
+        config["MESSBILDER"] = [str(Path(v).expanduser() if Path(v).expanduser().is_absolute()
+                                  else path.parent / Path(v).expanduser()) for v in entries]
+    return config
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="ArUco-Hoehenmessung mit optionaler gemeinsamer paralleler Messebene.")
+    parser.add_argument("--config", type=Path, help="Lokale JSON-Config; relative Pfade beziehen sich auf deren Ordner")
+    args = parser.parse_args(argv)
     try:
-        result = run_pipeline(CONFIG)
+        result = run_pipeline(load_configuration(args.config) if args.config else CONFIG)
     except Exception as exc:
         print(f"FEHLER: {exc}", file=sys.stderr)
         return 1
