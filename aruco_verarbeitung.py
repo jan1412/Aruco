@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""ArUco-Schichtdickenmessung mit fester Kamera und parallelen Messmarkern.
+"""ArUco-Höhenmessung mit Referenzebene und parallelen Messmarkern.
 
 Installation (nur eine OpenCV-Paketvariante in derselben Python-Umgebung):
-    python -m pip install "opencv-contrib-python>=4.7,<5" numpy scipy
+    python -m pip install -r requirements.txt
 Start:
     python aruco_verarbeitung.py
 
 Alle eigenen Angaben stehen im folgenden CONFIG-Block. Relative Pfade beziehen
-sich auf den Ordner dieser Skriptdatei. Windows-Pfade funktionieren beispielsweise
-als r"D:/Messung/bilder/referenz.png". Alle Größen und Abstände sind MILLIMETER.
+sich auf den Ordner dieser Skriptdatei. Pfade sind vor dem Start lokal einzutragen.
+Alle Größen und Abstände sind MILLIMETER.
 
 Kamerakalibrierung: zwei numerische NPY-Dateien für K und D, zwei NPZ-Dateien
 oder dieselbe gemeinsame NPZ-Datei in beiden Pfadfeldern. NPZ-Schlüssel können
@@ -21,8 +21,9 @@ oder:
              image_size=np.array([bildbreite, bildhoehe]))
 
 Geometrie: Grund-x/y liegen in der Referenzebene; Grund-z zeigt aus der bedruckten
-Referenzfläche zur Messfläche. Ein Referenzwinkel von 0 Grad bedeutet, dass die
-rechte Markerkante in Grund-x und die obere Markerkante in Grund-y liegen.
+Referenzfläche zur Messfläche. Bei einem Referenzwinkel von 0 Grad zeigt die
+Richtung von dekodierter Ecke 0 zu Ecke 1 nach Grund-+x und die Richtung von
+Ecke 3 zu Ecke 0 nach Grund-+y. Das ist unabhängig von der Bildausrichtung.
 Positive Winkel sind Drehungen um Grund-z nach der Rechte-Hand-Regel. Kantenlängen
 umfassen das schwarze Quadrat einschließlich seines schwarzen Rahmens, nicht
 den zusätzlichen weißen Druckrand. Referenzmarker und Kameraparameter müssen
@@ -42,6 +43,9 @@ lauf.json, konfiguration.json, lauf.log sowie JSON/TXT und optional markierten
 PNG-Bildern für jede Aufnahme. Unkonfigurierte Marker werden mit Bibliothek, ID
 und Bildecken gespeichert, aber ohne erfundene metrische Größe. Reprojektions-
 fehler sind Pixelwerte und kein Nachweis einer Messunsicherheit in Millimetern.
+Bei verworfener Referenzpose bleiben berechnete Höhen ausschließlich als
+Diagnosewerte erhalten; die gültige Höhenspalte bleibt leer. Exitcode 2 meldet
+mindestens ein unvollständiges oder verworfenes Messbild.
 Das Parallelitätsmodell passt x, y, z und eine Drehung in der Grundebene direkt
 an die vier Bildecken an. Jeder Messmarker erhält eine eigene lokale Höhe.
 """
@@ -70,66 +74,56 @@ from scipy.spatial.transform import Rotation
 
 
 # ======================= KONFIGURATION =======================
-# Alle Werte für Marker und Geometrie sind BEISPIELE: anpassen!
-CONFIG = {
-    "REFERENZBILD": "bilder/referenz.png",
-    "MESSBILDER": ["bilder/messung_*.png"],  # Einzelpfade, Ordner oder Globs.
-    "AUSGABEORDNER": "ergebnisse",
-
-    "KAMERAMATRIX_DATEI": "kalibrierung/K.npy",
-    "VERZEICHNUNG_DATEI": "kalibrierung/D.npy",
-    "KAMERAMATRIX_NPZ_KEY": None,  # z.B. "camera_matrix" oder "mtx".
-    "VERZEICHNUNG_NPZ_KEY": None,  # z.B. "dist_coeffs" oder "dist".
-    "KALIBRIER_AUFLOESUNG": None,  # Bei NPY zwingend: z.B. (1920, 1080).
-
-    "REFERENZ_IDS": [10, 11, 12, 13],
-    "MESS_IDS": [20, 21],
-    "REFERENZ_DICT": "DICT_4X4_50",
-    "MESS_DICT": "DICT_5X5_100",
-    "REFERENZ_GROESSE_MM": 30.0,
-    "MESS_GROESSE_MM": 30.0,
-    "REFERENZ_GROESSEN_MM": {},   # Größen je ID, z.B. {11: 40.0}.
-    "MESS_GROESSEN_MM": {},       # Größen je ID, z.B. {21: 50.0}.
-    "REFERENZ_DICTS": {},         # Bibliothek je ID, z.B. {13: "DICT_6X6_250"}.
-    "MESS_DICTS": {},             # Bibliothek je ID, z.B. {21: "DICT_6X6_250"}.
-
-    "REFERENZ_LAYOUT_MODUS": "positionen",  # "positionen" oder "abstaende".
-    # Mittelpunkte; x/y sind gerichtete Abstände zum gewählten Ursprung.
-    "REFERENZ_POSITIONEN_MM": {
-        10: (0.0, 0.0), 11: (200.0, 0.0),
-        12: (0.0, 150.0), 13: (200.0, 150.0),
-    },
-    # Nur bei Modus "abstaende": vollständige Paarabstände der MITTELPUNKTE.
-    "REFERENZ_ABSTAENDE_MM": [
-        (10, 11, 200.0), (10, 12, 150.0), (10, 13, 250.0),
-        (11, 12, 250.0), (11, 13, 150.0), (12, 13, 200.0),
-    ],
-    "REFERENZ_URSPRUNG_ID": 10,
-    "REFERENZ_X_ACHSE_ID": 11,    # Positive x-Richtung: Ursprung -> diese ID.
-    "REFERENZ_Y_SEITE_ID": 12,    # Dieser Marker liegt auf der positiven y-Seite.
-    "GEOMETRIE_MAX_ABWEICHUNG_MM": 0.5,
-    "REFERENZ_WINKEL_GRAD": {10: 0.0, 11: 0.0, 12: 0.0, 13: 0.0},
-    # Physische Höhe der gedruckten Referenzebene über Grund-z=0.
-    # 0 bedeutet: die gedruckte Referenzfläche selbst definiert Grund-z=0.
-    "REFERENZ_EBENENVERSATZ_MM": 0.0,
-
-    # Die Kamera steht laut Annahme unverändert: "fest" ist der Standard.
-    # "pro_bild" nutzt genügend sichtbare Referenzen für eine neue Pose;
-    # fehlen sie, wird weiterhin die feste Referenzpose verwendet.
-    "REFERENZPOSE_MODUS": "fest",
-    "MIN_REFERENZMARKER": 2,       # 1 ist möglich, geometrisch weniger robust.
-    "REF_KONTROLLE_MAX_RMS_PX": 1.5,  # None deaktiviert die Fehlerschranke.
-    "MESS_MAX_RMS_PX": 2.0,          # None deaktiviert die Fehlerschranke.
-
-    "NULL_MODUS": "konfiguriert",  # Oder "referenzbild".
-    "NULL_OFFSET_MM": 0.0,         # Rohhöhe des Trägers auf unbeschichtetem Grund.
-    "NULL_OFFSETS_MM": {},         # Individuelle Werte, z.B. {20: 0.2, 21: 2.5}.
-    "ANNOTIERTE_BILDER": True,
-    "CSV_DEZIMALKOMMA": True,
-}
+# Keine lokalen Pfade oder aufbauspezifischen Werte sind vorbelegt.
+# Vor dem Start Pfade, Markerdefinitionen und Referenzgeometrie eintragen.
+# Alle Laengen in Millimetern; NPZ-Aufloesung wird automatisch gelesen.
+# Modi und Felder sind in README.md dokumentiert.
+CONFIG = {'REFERENZBILD': None,
+ 'MESSBILDER': [],
+ 'AUSGABEORDNER': None,
+ 'KAMERAMATRIX_DATEI': None,
+ 'VERZEICHNUNG_DATEI': None,
+ 'KAMERAMATRIX_NPZ_KEY': 'camera_matrix',
+ 'VERZEICHNUNG_NPZ_KEY': 'dist_coeffs',
+ 'KALIBRIER_AUFLOESUNG': None,
+ 'REFERENZ_IDS': [],
+ 'MESS_IDS': [],
+ 'REFERENZ_DICT': None,
+ 'MESS_DICT': None,
+ 'REFERENZ_GROESSE_MM': None,
+ 'MESS_GROESSE_MM': None,
+ 'REFERENZ_GROESSEN_MM': {},
+ 'MESS_GROESSEN_MM': {},
+ 'REFERENZ_DICTS': {},
+ 'MESS_DICTS': {},
+ 'REFERENZ_LAYOUT_MODUS': 'positionen',
+ 'REFERENZ_RASTER_IDS': [],
+ 'REFERENZ_RASTER_ABSTAND_X_MM': None,
+ 'REFERENZ_RASTER_ABSTAND_Y_MM': None,
+ 'REFERENZ_POSITIONEN_MM': {},
+ 'REFERENZ_ABSTAENDE_MM': [],
+ 'REFERENZ_URSPRUNG_ID': None,
+ 'REFERENZ_X_ACHSE_ID': None,
+ 'REFERENZ_Y_SEITE_ID': None,
+ 'REFERENZ_Y_SEITE_VORZEICHEN': -1,
+ 'GEOMETRIE_MAX_ABWEICHUNG_MM': 0.5,
+ 'REFERENZ_WINKEL_GRAD': {},
+ 'REFERENZ_EBENENVERSATZ_MM': 0.0,
+ 'REFERENZPOSE_MODUS': 'pro_bild',
+ 'MIN_REFERENZMARKER': 3,
+ 'REF_KONTROLLE_MAX_RMS_PX': 1.5,
+ 'REF_KONTROLLE_WARN_RMS_PX': 1.0,
+ 'MESS_MAX_RMS_PX': 2.0,
+ 'DETEKTOR_PIXEL_PRO_ZELLE': 8,
+ 'DETEKTOR_SCHWELLENFENSTER_MAX': 23,
+ 'NULL_MODUS': 'konfiguriert',
+ 'NULL_OFFSET_MM': 0.0,
+ 'NULL_OFFSETS_MM': {},
+ 'ANNOTIERTE_BILDER': True,
+ 'CSV_DEZIMALKOMMA': True}
 # ===================== ENDE KONFIGURATION =====================
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -234,6 +228,10 @@ def build_specs(config):
     for key in ("REF_KONTROLLE_MAX_RMS_PX", "MESS_MAX_RMS_PX"):
         if config[key] is not None:
             config[key] = finite_number(config[key], key, positive=True)
+    warning_limit = config.get("REF_KONTROLLE_WARN_RMS_PX")
+    if warning_limit is not None:
+        config["REF_KONTROLLE_WARN_RMS_PX"] = finite_number(
+            warning_limit, "REF_KONTROLLE_WARN_RMS_PX", positive=True)
     finite_number(config["NULL_OFFSET_MM"], "NULL_OFFSET_MM")
     if set(config["NULL_OFFSETS_MM"]) - set(config["MESS_IDS"]):
         raise ProcessingError("NULL_OFFSETS_MM enthält unbekannte Messmarker-IDs.")
@@ -273,6 +271,9 @@ def layout_from_distances(config):
         raise ProcessingError(f"Alle Paarabstände erforderlich; fehlen: {sorted(required-set(pairs))}.")
     origin, axis, side = (config["REFERENZ_URSPRUNG_ID"], config["REFERENZ_X_ACHSE_ID"],
                           config["REFERENZ_Y_SEITE_ID"])
+    side_sign = config.get("REFERENZ_Y_SEITE_VORZEICHEN", 1)
+    if type(side_sign) is not int or side_sign not in (-1, 1):
+        raise ProcessingError("REFERENZ_Y_SEITE_VORZEICHEN muss +1 oder -1 sein.")
     if len({origin, axis, side}) != 3 or any(i not in ids for i in (origin, axis, side)):
         raise ProcessingError("Drei verschiedene gültige IDs für Ursprung, x-Achse und y-Seite wählen.")
     n = len(ids)
@@ -290,7 +291,7 @@ def layout_from_distances(config):
     ex = points[ids.index(axis)] / np.linalg.norm(points[ids.index(axis)])
     ey = np.array([-ex[1], ex[0]])
     points = points @ np.column_stack((ex, ey))
-    if points[ids.index(side), 1] < 0:
+    if points[ids.index(side), 1] * side_sign < 0:
         points[:, 1] *= -1
     fixed_distance = pairs[tuple(sorted((origin, axis)))]
     variable_ids = [i for i in ids if i not in (origin, axis)]
@@ -309,7 +310,7 @@ def layout_from_distances(config):
     if not fit.success or not np.isfinite(fit.x).all():
         raise ProcessingError("Referenzgeometrie konnte nicht aus Paarabständen bestimmt werden.")
     positions = unpack(fit.x)
-    if positions[side][1] < 0:
+    if positions[side][1] * side_sign < 0:
         positions = {i: p * np.array([1, -1]) for i, p in positions.items()}
     if abs(positions[side][1]) < 1e-6:
         raise ProcessingError("Marker für die y-Seite liegt auf der x-Achse.")
@@ -323,7 +324,30 @@ def layout_from_distances(config):
 
 def build_reference_geometry(config, specs):
     mode = config["REFERENZ_LAYOUT_MODUS"]
-    if mode == "abstaende":
+    if mode == "raster":
+        grid = config["REFERENZ_RASTER_IDS"]
+        if (not isinstance(grid, (list, tuple)) or not grid
+                or any(not isinstance(row, (list, tuple)) or not row for row in grid)
+                or any(len(row) != len(grid[0]) for row in grid)):
+            raise ProcessingError("REFERENZ_RASTER_IDS muss ein rechteckiges ID-Raster enthalten.")
+        flat = [marker_id for row in grid for marker_id in row]
+        if (any(type(i) is not int for i in flat) or len(set(flat)) != len(flat)
+                or set(flat) != set(config["REFERENZ_IDS"])):
+            raise ProcessingError("REFERENZ_RASTER_IDS muss jede Referenz-ID genau einmal enthalten.")
+        dx = finite_number(config["REFERENZ_RASTER_ABSTAND_X_MM"],
+                           "REFERENZ_RASTER_ABSTAND_X_MM", positive=True)
+        dy = finite_number(config["REFERENZ_RASTER_ABSTAND_Y_MM"],
+                           "REFERENZ_RASTER_ABSTAND_Y_MM", positive=True)
+        positions = {marker_id: np.array([column * dx, -row_number * dy])
+                     for row_number, row in enumerate(grid)
+                     for column, marker_id in enumerate(row)}
+        origin_id = config["REFERENZ_URSPRUNG_ID"]
+        if origin_id not in positions:
+            raise ProcessingError("REFERENZ_URSPRUNG_ID fehlt im Raster.")
+        origin_point = positions[origin_id].copy()
+        positions = {i: p - origin_point for i, p in positions.items()}
+        deviation = 0.0
+    elif mode == "abstaende":
         positions, deviation = layout_from_distances(config)
     elif mode == "positionen":
         positions, deviation = {}, 0.0
@@ -335,7 +359,7 @@ def build_reference_geometry(config, specs):
                 raise ProcessingError(f"Position ID {marker_id}: zwei endliche x/y-Werte erforderlich.")
             positions[marker_id] = point
     else:
-        raise ProcessingError("REFERENZ_LAYOUT_MODUS muss 'positionen' oder 'abstaende' sein.")
+        raise ProcessingError("REFERENZ_LAYOUT_MODUS muss 'raster', 'positionen' oder 'abstaende' sein.")
     z = finite_number(config["REFERENZ_EBENENVERSATZ_MM"], "REFERENZ_EBENENVERSATZ_MM")
     geometry, details = {}, []
     for spec in specs:
@@ -440,11 +464,20 @@ def measurement_paths(entries):
     return unique
 
 
-def make_detectors(specs):
+def make_detectors(specs, config=None):
+    config = CONFIG if config is None else config
+    pixels_per_cell = config.get("DETEKTOR_PIXEL_PRO_ZELLE", 8)
+    if type(pixels_per_cell) is not int or pixels_per_cell < 1:
+        raise ProcessingError("DETEKTOR_PIXEL_PRO_ZELLE muss eine positive ganze Zahl sein.")
+    max_window = config.get("DETEKTOR_SCHWELLENFENSTER_MAX", 23)
+    if type(max_window) is not int or max_window < 3:
+        raise ProcessingError("DETEKTOR_SCHWELLENFENSTER_MAX muss eine ganze Zahl >= 3 sein.")
     detectors = {}
     for name in sorted({s.dictionary for s in specs}):
         parameters = cv2.aruco.DetectorParameters()
         parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        parameters.perspectiveRemovePixelPerCell = pixels_per_cell
+        parameters.adaptiveThreshWinSizeMax = max_window
         detectors[name] = cv2.aruco.ArucoDetector(dictionary_object(name), parameters)
     return detectors
 
@@ -539,7 +572,7 @@ def check_limit(value, limit, label):
         raise ProcessingError(f"{label}: RMS {value:.3f} px überschreitet {limit:.3f} px.")
 
 
-def estimate_reference_pose(observations, geometry, K, D, config, source):
+def estimate_reference_pose(observations, geometry, K, D, config, source, enforce_quality=True):
     ids, points, pixels = reference_correspondences(observations, geometry)
     if len(ids) < config["MIN_REFERENZMARKER"]:
         raise ProcessingError(f"Referenzpose braucht mindestens {config['MIN_REFERENZMARKER']} Marker; erkannt: {len(ids)}.")
@@ -548,23 +581,47 @@ def estimate_reference_pose(observations, geometry, K, D, config, source):
         R = cv2.Rodrigues(rvec)[0]
         center_camera = R @ points.mean(axis=0) + tvec.reshape(3)
         if np.dot(R[:, 2], -center_camera) > 0:
-            check_limit(rms, config["REF_KONTROLLE_MAX_RMS_PX"], "Referenzpose")
+            if enforce_quality:
+                check_limit(rms, config["REF_KONTROLLE_MAX_RMS_PX"], "Referenzpose")
             return Pose(rvec, tvec, rms, source, ids)
     raise ProcessingError("Keine plausible Referenzpose: Eckzuordnung, Maße und Referenzwinkel prüfen.")
 
 
-def select_reference_pose(observations, base_pose, geometry, K, D, config):
+def select_reference_pose(observations, base_pose, geometry, K, D, config, enforce_quality=True):
     ids, points, pixels = reference_correspondences(observations, geometry)
     if config["REFERENZPOSE_MODUS"] == "pro_bild" and len(ids) >= config["MIN_REFERENZMARKER"]:
-        pose = estimate_reference_pose(observations, geometry, K, D, config, "measurement_image")
+        pose = estimate_reference_pose(observations, geometry, K, D, config, "measurement_image",
+                                       enforce_quality=enforce_quality)
     else:
         pose = base_pose
     control_rms = None
     if points is not None:
         control_rms = reprojection_rms(points, pixels, pose.rvec, pose.tvec, K, D)
-        check_limit(control_rms, config["REF_KONTROLLE_MAX_RMS_PX"], "Referenzkontrolle im Messbild")
+        if enforce_quality:
+            check_limit(control_rms, config["REF_KONTROLLE_MAX_RMS_PX"], "Referenzkontrolle im Messbild")
     return pose, {"visible_reference_ids": ids, "control_rms_px": control_rms,
                   "control_available": points is not None}
+
+
+def apply_reference_quality(records, control, config):
+    """Berechnete Höhen bei schlechter Referenz nur als Diagnose aufbewahren."""
+    rms = control["control_rms_px"]
+    if rms is None:
+        return None
+    try:
+        check_limit(rms, config["REF_KONTROLLE_MAX_RMS_PX"], "Referenzkontrolle im Messbild")
+    except ProcessingError as exc:
+        message = str(exc)
+        for record in records:
+            if record["role"] != "measurement":
+                continue
+            if "height_mm" in record:
+                record["diagnostic_height_mm"] = record.pop("height_mm")
+            previous_error = record.get("error")
+            record.update(status="error", error=message +
+                          (" " + previous_error if previous_error else ""))
+        return message
+    return None
 
 
 def free_marker_pose(observation, spec, K, D, pose):
@@ -687,6 +744,14 @@ def save_json(path, content):
 
 def annotate_image(image, report, K, D):
     output = image.copy()
+    reference_rms = report.get("reference_control", {}).get("control_rms_px")
+    title = f"Status: {report['status']}"
+    if reference_rms is not None:
+        title += f" | Referenz-RMS: {reference_rms:.2f} px"
+    if report.get("warnings"):
+        title += " | Qualitaetshinweis: siehe Bericht"
+    cv2.putText(output, title, (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                (40, 40, 230) if report["status"] == "error" else (0, 140, 255), 2, cv2.LINE_AA)
     pose_data = report.get("reference_pose")
     if pose_data:
         cv2.drawFrameAxes(output, K, D, np.array(pose_data["rvec_ground_to_camera"]),
@@ -702,6 +767,8 @@ def annotate_image(image, report, K, D):
         lines = [f"{short_name}:{record['id']}  {role}"]
         if "height_mm" in record:
             lines.append(f"h={record['height_mm']:.3f} mm  RMS={record['reprojection_rms_px']:.2f}px")
+        elif "diagnostic_height_mm" in record:
+            lines.append(f"Diagnose h={record['diagnostic_height_mm']:.3f} mm - UNGUELTIG")
         elif status == "error":
             lines.append("FEHLER: siehe TXT/JSON")
         x = max(0, min(int(points[:, 0].min()), output.shape[1] - 20))
@@ -721,6 +788,7 @@ def write_frame_outputs(directory, prefix, report, image, K, D, config):
     lines = [f"Bild: {report['image']}", f"Status: {report['status']}"]
     if "error" in report:
         lines.append("Fehler: " + report["error"])
+    lines.extend("HINWEIS: " + warning for warning in report.get("warnings", []))
     if report.get("reference_pose"):
         lines.append("Referenzquelle: " + report["reference_pose"]["source"])
         for label in ("T_ground_to_camera", "T_camera_to_ground"):
@@ -744,6 +812,8 @@ def write_frame_outputs(directory, prefix, report, image, K, D, config):
         if "height_mm" in record:
             lines.extend([f"Nullhoehe_mm: {record['zero_mm']:.6f} ({record['zero_source']})",
                           f"Korrigierte_Hoehe_mm: {record['height_mm']:.6f}"])
+        if "diagnostic_height_mm" in record:
+            lines.append(f"Diagnostische_Hoehe_mm: {record['diagnostic_height_mm']:.6f} (UNGUELTIG)")
         if "error" in record:
             lines.append("Fehler: " + record["error"])
     (directory / f"{prefix}.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -775,15 +845,20 @@ def measurement_rows(report, specs):
                 row.update(rms_px=record["reprojection_rms_px"], drehung_grad=record["rotation_in_ground_plane_deg"])
             if "height_mm" in record:
                 row.update(hoehe_mm=record["height_mm"], nullhoehe_mm=record["zero_mm"], nullquelle=record["zero_source"])
+            if "diagnostic_height_mm" in record:
+                row["diagnostische_hoehe_mm"] = record["diagnostic_height_mm"]
         if report.get("reference_pose"):
             row["referenzquelle"] = report["reference_pose"]["source"]
+        row["referenz_rms_px"] = report.get("reference_control", {}).get("control_rms_px")
+        row["hinweise"] = " | ".join(report.get("warnings", []))
         rows.append(row)
     return rows
 
 
 def write_csv(path, rows, decimal_comma):
     columns = ["bild", "bibliothek", "id", "groesse_mm", "status", "hoehe_mm", "x_mm", "y_mm",
-               "z_roh_mm", "nullhoehe_mm", "nullquelle", "drehung_grad", "rms_px", "referenzquelle", "fehler"]
+               "z_roh_mm", "nullhoehe_mm", "nullquelle", "drehung_grad", "rms_px", "referenzquelle",
+               "referenz_rms_px", "diagnostische_hoehe_mm", "hinweise", "fehler"]
     def value(v):
         if isinstance(v, (float, np.floating)):
             text = f"{v:.6f}"
@@ -799,14 +874,33 @@ def write_csv(path, rows, decimal_comma):
 def run_pipeline(config):
     """Auswerten und Ergebnisordner zurückgeben; auch aus anderem Python nutzbar."""
     config = copy.deepcopy(config)
+    for key in ("REFERENZBILD", "MESSBILDER", "AUSGABEORDNER",
+                "KAMERAMATRIX_DATEI", "VERZEICHNUNG_DATEI"):
+        if not config.get(key):
+            raise ProcessingError(f"CONFIG[{key!r}] fehlt. Bitte lokale Eingaben konfigurieren.")
     specs = build_specs(config)
     spec_map = {s.key: s for s in specs}
     geometry, geometry_details = build_reference_geometry(config, specs)
     K, D, image_size = load_calibration(config)
+    calibration_rms = None
+    calibration_path = resolve_path(config["KAMERAMATRIX_DATEI"])
+    if calibration_path.suffix.lower() == ".npz":
+        with np.load(calibration_path, allow_pickle=False) as calibration_data:
+            if "rms_px" in calibration_data:
+                calibration_rms = finite_number(calibration_data["rms_px"].item(), "Kalibrierungs-RMS")
+    common_warnings = []
+    if calibration_rms is not None and calibration_rms > 0.5:
+        common_warnings.append(f"Kalibrierungs-RMS {calibration_rms:.3f} px > 0.5 px; "
+                               "Höhen sind Schätzwerte, nicht in Millimetern validiert.")
+    if (config["NULL_MODUS"] == "konfiguriert" and config["NULL_OFFSET_MM"] == 0
+            and not config["NULL_OFFSETS_MM"]):
+        common_warnings.append("Ohne gemessene Nullhöhe: Abstand der Markeroberfläche "
+                               "zur Referenzfläche einschließlich Papier/Träger.")
+    expected_measurements = sum(s.role == "measurement" for s in specs)
     reference_path = resolve_path(config["REFERENZBILD"])
     reference_image = read_image(reference_path, image_size)
     image_paths = measurement_paths(config["MESSBILDER"])
-    detectors = make_detectors(specs)
+    detectors = make_detectors(specs, config)
     reference_observations = detect_markers(reference_image, detectors, spec_map)
     base_pose = estimate_reference_pose(reference_observations, geometry, K, D, config, "reference_image")
 
@@ -826,6 +920,8 @@ def run_pipeline(config):
         logger.info("Version %s | Ergebnisordner: %s", VERSION, directory)
         logger.info("Referenz: %s | IDs %s | RMS %.4f px | Modus %s", reference_path,
                     base_pose.reference_ids, base_pose.rms_px, config["REFERENZPOSE_MODUS"])
+        for warning in common_warnings:
+            logger.warning(warning)
         save_json(directory / "konfiguration.json", config)
         reference_records = analyze_observations(reference_observations, spec_map, base_pose, K, D, config)
         levels = zero_levels(config, specs, reference_records)
@@ -833,31 +929,44 @@ def run_pipeline(config):
         reference_report = {"image": reference_path, "status": "reference", "reference_pose": base_pose.as_dict(),
                             "reference_control": {"visible_reference_ids": base_pose.reference_ids,
                                                    "control_rms_px": base_pose.rms_px, "control_available": True},
-                            "markers": reference_records}
+                            "markers": reference_records, "warnings": common_warnings.copy()}
         write_frame_outputs(directory, "000_referenz", reference_report, reference_image, K, D, config)
         for spec in specs:
             if spec.role == "measurement" and spec.key not in levels:
                 logger.warning("Keine Nullhöhe für %s:%s; diese ID wird nicht korrigiert ausgegeben.", *spec.key)
         for index, path in enumerate(image_paths, 1):
-            report = {"image": path, "status": "error", "markers": []}
+            report = {"image": path, "status": "error", "markers": [], "warnings": common_warnings.copy()}
             image = None
             try:
                 image = read_image(path, image_size)
                 observations = detect_markers(image, detectors, spec_map)
                 report["markers"] = [dict(o, status="unprocessed") for o in observations]
-                pose, control = select_reference_pose(observations, base_pose, geometry, K, D, config)
+                # Zunächst rechnen; die harte Referenzprüfung entwertet unten
+                # sämtliche Messhöhen, bewahrt aber die Diagnosewerte auf.
+                pose, control = select_reference_pose(observations, base_pose, geometry, K, D, config,
+                                                       enforce_quality=False)
                 report.update(reference_pose=pose.as_dict(), reference_control=control)
                 records = analyze_observations(observations, spec_map, pose, K, D, config)
                 apply_zero_levels(records, levels)
+                reference_error = apply_reference_quality(records, control, config)
+                warning_limit = config.get("REF_KONTROLLE_WARN_RMS_PX")
+                if (warning_limit is not None and control["control_rms_px"] is not None
+                        and control["control_rms_px"] > warning_limit):
+                    warning = (f"Referenz-RMS {control['control_rms_px']:.3f} px "
+                               f"> Warnschwelle {warning_limit:.3f} px.")
+                    report["warnings"].append(warning)
+                    logger.warning("%s | %s", path.name, warning)
                 report["markers"] = records
                 seen_measurements = [r for r in records if r["role"] == "measurement"]
                 valid = [r for r in seen_measurements if r["status"] == "ok"]
-                if not seen_measurements:
+                if reference_error:
+                    report.update(status="error", error=reference_error)
+                elif not seen_measurements:
                     report.update(status="no_measurements", error="Keine konfigurierten Messmarker erkannt.")
                 elif not valid:
                     report.update(status="error", error="Alle erkannten Messmarker sind nicht auswertbar.")
                 else:
-                    report["status"] = "ok" if len(valid) == len(seen_measurements) else "partial"
+                    report["status"] = "ok" if len(valid) == expected_measurements else "partial"
                 logger.info("%s | %s | %d gültige Höhen | Referenzquelle %s", path.name,
                             report["status"], len(valid), pose.source)
                 for record in valid:
@@ -875,21 +984,28 @@ def run_pipeline(config):
             rows.extend(measurement_rows(report, specs))
         write_csv(directory / "hoehen.csv", rows, config["CSV_DEZIMALKOMMA"])
         summary = {"version": VERSION, "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                   "run_directory": directory, "camera_assumption": "fixed",
-                   "calibration": {"K": K, "D": D, "image_size": image_size},
+                   "run_directory": directory, "reference_pose_mode": config["REFERENZPOSE_MODUS"],
+                   "calibration": {"K": K, "D": D, "image_size": image_size, "rms_px": calibration_rms,
+                                   "camera_matrix_file": calibration_path,
+                                   "dist_coeffs_file": resolve_path(config["VERZEICHNUNG_DATEI"])},
+                   "warnings": common_warnings,
                    "reference_geometry": geometry_details, "reference_pose": base_pose.as_dict(),
                    "zero_levels": [{"dictionary": key[0], "id": key[1], "zero_mm": v[0], "source": v[1]}
                                    for key, v in levels.items()],
                    "images_total": len(reports), "valid_measurements": sum(r["status"] == "ok" for r in rows),
                    "images_error": sum(r["status"] == "error" for r in reports),
+                   "images_incomplete": sum(r["status"] != "ok" for r in reports),
                    "reports": reports}
         save_json(directory / "lauf.json", summary)
         text = [f"ArUco-Verarbeitung {VERSION}", f"Messbilder: {len(reports)}",
                 f"Gueltige Hoehen: {summary['valid_measurements']}",
-                "Kamera unveraendert; Messmarker parallel zur Grundebene.",
-                "RMS-Pixelwerte sind keine Messunsicherheit in Millimetern.", ""]
+                f"Referenzpose: {config['REFERENZPOSE_MODUS']}; Messmarker parallel zur Grundebene.",
+                "RMS-Pixelwerte sind keine Messunsicherheit in Millimetern.",
+                *common_warnings, ""]
         for row in rows:
             h = f"{row['hoehe_mm']:.6f} mm" if "hoehe_mm" in row else "keine Hoehe"
+            if "diagnostische_hoehe_mm" in row:
+                h = f"Diagnose {row['diagnostische_hoehe_mm']:.6f} mm (UNGUELTIG)"
             text.append(f"{Path(row['bild']).name} | {row['bibliothek']}:{row['id']} | {row['status']} | {h} | {row['fehler']}")
         (directory / "zusammenfassung.txt").write_text("\n".join(text) + "\n", encoding="utf-8")
         logger.info("Fertig: %d gültige Höhen, %d fehlerhafte Messbilder.",
@@ -907,7 +1023,7 @@ def main():
     except Exception as exc:
         print(f"FEHLER: {exc}", file=sys.stderr)
         return 1
-    return 0 if result["valid_measurements"] and not result["images_error"] else 2
+    return 0 if result["valid_measurements"] and not result["images_incomplete"] else 2
 
 
 if __name__ == "__main__":

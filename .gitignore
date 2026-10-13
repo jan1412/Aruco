@@ -1,0 +1,43 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local credentials and editor settings
+.env
+.env.*
+*.pem
+*.key
+.vscode/
+.idea/
+config.local.*
+
+# Camera inputs, parameters and measurement outputs
+calib/
+camera/
+read/
+images/
+calibration/
+results/
+ergebnisse*/
+AUSWERTUNG.md
+*.npy
+*.npz
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+*.heic
+*.csv
+*.log
+camera_calibration.json
+camera_calibration.yml
+konfiguration.json
+lauf.json
+summary.txt
+zusammenfassung.txt
