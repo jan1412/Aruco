@@ -138,7 +138,7 @@ CONFIG = {'REFERENZBILD': None,
  'CSV_DEZIMALKOMMA': True}
 # ===================== ENDE KONFIGURATION =====================
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -1092,9 +1092,11 @@ def write_csv(path, rows, decimal_comma, columns=None):
             writer.writerow({key: value(v) for key, v in row.items()})
 
 
-def run_pipeline(config):
+def run_pipeline(config=None):
     """Auswerten und Ergebnisordner zurückgeben; auch aus anderem Python nutzbar."""
-    config = copy.deepcopy(config)
+    if config is not None and (not isinstance(config, dict) or set(config) - set(CONFIG)):
+        raise ProcessingError("Config muss ein dict mit bekannten CONFIG-Feldern sein.")
+    config = {**copy.deepcopy(CONFIG), **copy.deepcopy(config or {})}
     for key in ("REFERENZBILD", "MESSBILDER", "AUSGABEORDNER",
                 "KAMERAMATRIX_DATEI", "VERZEICHNUNG_DATEI"):
         if not config.get(key):
@@ -1261,7 +1263,7 @@ def run_pipeline(config):
 def load_configuration(path):
     """JSON overrides; ID-keyed maps and paths relative to the local config."""
     path = Path(path).expanduser().resolve()
-    overrides = json.loads(path.read_text(encoding="utf-8"))
+    overrides = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(overrides, dict) or set(overrides) - set(CONFIG):
         raise ProcessingError("Config muss ein JSON-Objekt mit bekannten CONFIG-Feldern sein.")
     config = copy.deepcopy(CONFIG)

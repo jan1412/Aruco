@@ -2,9 +2,9 @@
 """Separate Referenz- und Messbildserien mitteln, mit optionaler ArUco-Kontrolle.
 
 Installation:
-    python -m pip install "opencv-contrib-python>=4.7,<5" numpy
+    python -m pip install -r requirements.txt
 Start:
-    python aruco_serienmittelung.py
+    python aruco_serienmittelung.py --config serien.config.local.json
 
 Beispielstruktur (ein unveränderter Zustand je Ordner):
     serien/referenz/             -> Referenzaufnahmen
@@ -33,6 +33,7 @@ Keine 3D-Posenschätzung und keine Kalibrierdateien erforderlich.
 from __future__ import annotations
 
 import copy
+import argparse
 import json
 import re
 import sys
@@ -47,16 +48,17 @@ import numpy as np
 
 # ========================== KONFIGURATION ==========================
 CONFIG = {
-    "REFERENZ_ORDNER": "serien/referenz",
-    "MESS_ORDNER": "serien/messungen",
-    "AUSGABEORDNER": "serien_ergebnisse",
+    "REFERENZ_ORDNER": None,
+    "MESS_ORDNER": None,
+    "AUSGABEORDNER": None,
+    "AUSGESCHLOSSENE_DATEIMUSTER": ["*_gemittelt*.png"],
     "MIN_BILDER": 2,  # Nach Ausschluss ungeeigneter Aufnahmen.
     "MARKERPRUEFUNG": True,  # False: reine Pixelmittelung.
 
-    "REFERENZ_IDS": [10, 11, 12, 13],
-    "REFERENZ_DICT": "DICT_5X5_50",
-    "MESS_IDS": [0, 1],
-    "MESS_DICT": "DICT_4X4_100",
+    "REFERENZ_IDS": [],
+    "REFERENZ_DICT": None,
+    "MESS_IDS": [],
+    "MESS_DICT": None,
     "MIN_REFERENZMARKER": 3,  # Nur in der Referenzserie zwingend.
     "MIN_MESSMARKER": 2,      # Nur in den Messserien zwingend.
     # Zusätzliche Höhenkontrollen ebenfalls auf Stabilität prüfen, z.B.:
@@ -76,7 +78,7 @@ CONFIG = {
 }
 # ======================== ENDE KONFIGURATION ========================
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 BASE_DIR = Path(__file__).resolve().parent
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -90,12 +92,13 @@ def resolve_path(value):
     return (BASE_DIR / p).resolve() if not p.is_absolute() else p.resolve()
 
 
-def image_paths(directory):
+def image_paths(directory, excluded_patterns=()):
     directory = Path(directory)
     if not directory.is_dir():
         raise SeriesError(f"Serienordner fehlt: {directory}")
     return sorted(p for p in directory.iterdir()
-                  if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
+                  if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+                  and not any(p.match(pattern) for pattern in excluded_patterns))
 
 
 def read_image(path):
@@ -115,12 +118,39 @@ def save_json(path, data):
                                     allow_nan=False, default=serializable) + "\n", encoding="utf-8")
 
 
-def validate_config(config):
+def prepare_config(config=None):
+    if config is not None and (not isinstance(config, dict) or set(config) - set(CONFIG)):
+        raise SeriesError("Config muss ein dict mit bekannten CONFIG-Feldern sein.")
+    result = copy.deepcopy(CONFIG)
+    if config is not None:
+        result.update(copy.deepcopy(config))
+    return result
+
+
+def load_configuration(path):
+    """Load JSON overrides; relative folders are anchored to the config file."""
+    path = Path(path).expanduser().resolve()
+    result = prepare_config(json.loads(path.read_text(encoding="utf-8-sig")))
     for key in ("REFERENZ_ORDNER", "MESS_ORDNER", "AUSGABEORDNER"):
+        if result[key] is not None:
+            if not isinstance(result[key], str) or not result[key]:
+                raise SeriesError(f"{key}: nichtleerer Ordnerpfad erforderlich.")
+            folder = Path(result[key]).expanduser()
+            result[key] = str(folder if folder.is_absolute() else path.parent / folder)
+    validate_config(result)
+    return result
+
+
+def validate_config(config, require_paths=True):
+    for key in (("REFERENZ_ORDNER", "MESS_ORDNER", "AUSGABEORDNER") if require_paths else ()):
         if not isinstance(config[key], (str, Path)) or not str(config[key]):
             raise SeriesError(f"{key}: Ordnerpfad erforderlich.")
     if type(config["MARKERPRUEFUNG"]) is not bool:
         raise SeriesError("MARKERPRUEFUNG muss True oder False sein.")
+    patterns = config["AUSGESCHLOSSENE_DATEIMUSTER"]
+    if (not isinstance(patterns, (list, tuple))
+            or any(not isinstance(pattern, str) or not pattern for pattern in patterns)):
+        raise SeriesError("AUSGESCHLOSSENE_DATEIMUSTER: Liste nichtleerer Glob-Muster erforderlich.")
     for key in ("MIN_BILDER", "MIN_MARKERBEOBACHTUNGEN", "DETEKTOR_PIXEL_PRO_ZELLE"):
         if type(config[key]) is not int or config[key] < 1:
             raise SeriesError(f"{key}: positive ganze Zahl erforderlich.")
@@ -217,22 +247,24 @@ def mittel_bildserie(input_directory, output_file, kind="messung", config=None,
     (Höhe,Breite,Kanäle)-Form, z.B. die Form des Referenzmittelbildes.
     Bei Fehlern wird KEIN Mittelbild geschrieben; Bericht enthält die Ursache.
     """
-    config = copy.deepcopy(CONFIG if config is None else config)
-    validate_config(config)
+    config = prepare_config(config)
+    validate_config(config, require_paths=False)
     if kind not in ("referenz", "messung"):
         raise SeriesError("kind muss 'referenz' oder 'messung' sein.")
-    directory, output_file = Path(input_directory).resolve(), Path(output_file).resolve()
+    directory, output_file = resolve_path(input_directory), resolve_path(output_file)
     if output_file.suffix.lower() != ".png":
         raise SeriesError("Mittelbilder werden verlustfrei als PNG gespeichert.")
     if output_file.exists():
         raise SeriesError(f"Ausgabedatei existiert bereits: {output_file}")
-    if directory in output_file.parents:
-        raise SeriesError("Ausgaben außerhalb des Eingabeordners speichern.")
+    if (directory in output_file.parents
+            and not any(output_file.match(pattern) for pattern in config["AUSGESCHLOSSENE_DATEIMUSTER"])):
+        raise SeriesError("Ausgabe muss ausserhalb der Eingaben liegen oder durch ein Dateimuster ausgeschlossen sein.")
     report = {"series": directory.name, "kind": kind, "input_directory": str(directory),
               "status": "error", "frames": [], "output_file": None,
               "marker_check": config["MARKERPRUEFUNG"], "warnings": []}
     try:
-        paths = image_paths(directory)
+        paths = image_paths(directory, config["AUSGESCHLOSSENE_DATEIMUSTER"])
+        report["excluded_patterns"] = list(config["AUSGESCHLOSSENE_DATEIMUSTER"])
         report["images_total"] = len(paths)
         if len(paths) < config["MIN_BILDER"]:
             raise SeriesError(f"Mindestens {config['MIN_BILDER']} Bilder je Serie erforderlich.")
@@ -348,9 +380,9 @@ def mittel_bildserie(input_directory, output_file, kind="messung", config=None,
     return report
 
 
-def discover_measurement_series(root):
-    direct = image_paths(root)
-    nested = [p for p in sorted(Path(root).iterdir()) if p.is_dir() and image_paths(p)]
+def discover_measurement_series(root, excluded_patterns=()):
+    direct = image_paths(root, excluded_patterns)
+    nested = [p for p in sorted(Path(root).iterdir()) if p.is_dir() and image_paths(p, excluded_patterns)]
     if direct and nested:
         raise SeriesError("MESS_ORDNER enthält Bilder und Serien-Unterordner. Eine Struktur wählen.")
     if nested:
@@ -362,11 +394,11 @@ def discover_measurement_series(root):
 
 def serien_auswerten(config=None):
     """Referenzserie und getrennte Messserien auswerten; Ergebnisbericht liefern."""
-    config = copy.deepcopy(CONFIG if config is None else config)
+    config = prepare_config(config)
     validate_config(config)
     ref_dir = resolve_path(config["REFERENZ_ORDNER"])
     mess_root = resolve_path(config["MESS_ORDNER"])
-    series_dirs = discover_measurement_series(mess_root)
+    series_dirs = discover_measurement_series(mess_root, config["AUSGESCHLOSSENE_DATEIMUSTER"])
     out_root = resolve_path(config["AUSGABEORDNER"])
     for input_dir in (ref_dir, mess_root):
         if out_root == input_dir or input_dir in out_root.parents:
@@ -418,14 +450,17 @@ def serien_auswerten(config=None):
     return report
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Statische Referenz- und Messserien mitteln.")
+    parser.add_argument("--config", type=Path, help="Lokale JSON-Config mit Input/Output und Markerdefinitionen")
+    args = parser.parse_args(argv)
     try:
-        report = serien_auswerten(CONFIG)
+        report = serien_auswerten(load_configuration(args.config) if args.config else CONFIG)
         print(f"Status: {report['status']} | Ergebnisse: {report['run_directory']}")
         for series in [report["reference"]] + report["measurements"]:
             print(f"{series['series']}: {series['status']} | {series.get('output_file') or series.get('error')}")
         return 0 if report["status"] == "ok" else 2
-    except (SeriesError, OSError, KeyError) as exc:
+    except (SeriesError, OSError, UnicodeError, KeyError, json.JSONDecodeError) as exc:
         print(f"FEHLER: {exc}", file=sys.stderr)
         return 1
 

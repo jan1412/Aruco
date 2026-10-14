@@ -71,7 +71,17 @@ das Standardmodell und ein Modell mit festem `k3=0` auf denselben Pruefecken.
 
 ## Höhenmessung
 
-Vor dem Start von `aruco_verarbeitung.py` die lokale `CONFIG` ausfüllen:
+Empfohlen: `config.example.json` nach `config.local.json` kopieren und die
+Ein-/Ausgaben sowie Markerdefinitionen dort eintragen:
+
+```sh
+python aruco_verarbeitung.py --config config.local.json
+```
+
+Relative Pfade beziehen sich auf den Ordner der JSON-Config. UTF-8-Dateien mit
+oder ohne BOM werden unterstützt. Die lokale Config wird nicht veröffentlicht.
+
+Folgende Felder in der JSON-Config oder im Python-Block `CONFIG` ausfüllen:
 
 - `REFERENZBILD`, `MESSBILDER`, `AUSGABEORDNER`: eigene Eingaben und Ausgabeziel.
   Messbilder können als Ordner, Einzelpfade oder Globs angegeben werden.
@@ -96,7 +106,9 @@ python aruco_verarbeitung.py
 
 Alle Pfadfelder und aufbauspezifischen Geometriewerte sind leer beziehungsweise
 `None`. Ein nicht konfigurierter Start bricht mit einer erklärenden Meldung ab.
-Relative Konfigurationspfade beziehen sich auf den Skriptordner.
+Relative Pfade im Python-Konfigurationsblock beziehen sich auf den Skriptordner.
+
+Der Python-Konfigurationsblock ist die Alternative zur externen JSON-Datei.
 
 `REFERENZPOSE_MODUS="pro_bild"` schätzt die Referenzpose bei ausreichend
 sichtbaren Referenzmarkern je Aufnahme. Andernfalls wird die Pose des
@@ -109,6 +121,54 @@ Spalte leer; berechnete Werte werden ausdrücklich als ungültige Diagnose in
 `diagnostische_hoehe_mm` aufbewahrt. Warnungen, Posen und Bildecken stehen
 zusätzlich in den Berichten. Exitcode 0 bedeutet vollständige Auswertung,
 1 einen Startfehler und 2 mindestens ein unvollständiges oder verworfenes Bild.
+
+## Serienmittelung
+
+`aruco_serienmittelung.py` mittelt eine Referenzserie und getrennte Messserien.
+`serien.config.example.json` als `serien.config.local.json` kopieren. Dort
+`REFERENZ_ORDNER`, `MESS_ORDNER`, `AUSGABEORDNER` und die Markerdefinitionen
+eintragen. Eingabe- und Ausgabeordner sind in der veröffentlichten Vorlage leer.
+
+```sh
+python aruco_serienmittelung.py --config serien.config.local.json
+```
+
+`MESS_ORDNER` enthält entweder eine Bildserie oder Unterordner mit getrennten
+Serien. Beide Strukturen nicht mischen. Relative Ordner beziehen sich auf den
+Ort der Config. Jeder Lauf erhält einen neuen Ergebnisordner mit unbeschrifteten
+PNG-Mittelbildern und Qualitätsbericht. Geometrie und Auflösung bleiben erhalten.
+
+`AUSGESCHLOSSENE_DATEIMUSTER` schließt standardmäßig `*_gemittelt*.png` aus,
+damit vorherige Mittelbilder nicht nochmals als Eingang dienen. Die Prüfung
+vergleicht zeitliche Markerecken, nicht den Reprojektionsfehler der Höhenmessung.
+Eine verworfene Serie erzeugt kein freigegebenes Mittelbild. Details und aktive
+Schritte stehen im [Guide](OPTIMIERUNGEN.md#10-serienmittelung-mit-eigener-inputoutput-config).
+
+## Aufruf aus anderen Skripten
+
+Das ganze Modul importieren und die Funktion über den Modulnamen aufrufen:
+
+```python
+import aruco_serienmittelung
+import aruco_verarbeitung
+
+serien_config = aruco_serienmittelung.load_configuration("serien.config.local.json")
+serien = aruco_serienmittelung.serien_auswerten(serien_config)
+if serien["status"] != "ok":
+    raise RuntimeError("Serienprüfung fehlgeschlagen; Qualitätsbericht prüfen.")
+
+mess_config = aruco_verarbeitung.load_configuration("config.local.json")
+mess_config.update(serien["processing_config_paths"])
+messung = aruco_verarbeitung.run_pipeline(mess_config)
+```
+
+`main()` dient dem CLI-Start. Für andere Skripte die oben genannten APIs nutzen;
+sie lesen keine CLI-Argumente des aufrufenden Programms. Das ausführbare
+`pipeline_example.py` zeigt diese Kopplung und stoppt bei verworfenen Serien:
+
+```sh
+python pipeline_example.py --series-config serien.config.local.json --measurement-config config.local.json
+```
 
 ## Qualität und lokale Daten
 

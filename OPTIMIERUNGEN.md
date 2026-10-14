@@ -272,3 +272,92 @@ Genauigkeit einer realen Kamera. Weiterführend:
 [OpenCV-Boards](https://docs.opencv.org/4.x/db/da9/tutorial_aruco_board_detection.html),
 [Poseverfahren](https://docs.opencv.org/4.x/d5/d1f/calib3d_solvePnP.html),
 [Kalibrierung](https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html).
+
+## 10. Serienmittelung mit eigener Input/Output-Config
+
+`serien.config.example.json` als `serien.config.local.json` speichern. Die drei
+Ordnerfelder `REFERENZ_ORDNER`, `MESS_ORDNER` und `AUSGABEORDNER` ausfüllen.
+Zusätzlich die tatsächlichen Referenz-/Messmarker-IDs und Dictionaries eintragen.
+Die Referenzserie und jede Messserie müssen jeweils einen unveränderten Zustand
+zeigen. Kamera, Fokus, Objektposition und Pixelausrichtung innerhalb einer Serie
+beibehalten. Mehrere Zustände in getrennte Ordner aufteilen.
+
+```sh
+python aruco_serienmittelung.py --config serien.config.local.json
+```
+
+Relative Ordnerangaben beziehen sich auf die Config-Datei. JSON in UTF-8 mit
+oder ohne BOM ist möglich. Bei `MESS_ORDNER` zwischen einer direkten Bildserie
+und getrennten Serien-Unterordnern wählen. Der Ausgabeordner für die gesamte
+Auswertung muss außerhalb der Eingabeordner liegen. Ein neuer Lauf erhält einen
+eigenen Unterordner und überschreibt keine Mittelbilder.
+
+Bei direktem Aufruf von `mittel_bildserie` darf die Ausgabe auch im Serienordner
+liegen, wenn ihr Name durch `AUSGESCHLOSSENE_DATEIMUSTER` ausgeschlossen ist.
+Standardmäßig werden `*_gemittelt*.png` nicht als Eingabe gelesen. Bei anderen
+Ausgabenamen das Ausschlussmuster ergänzen oder außerhalb der Eingaben speichern.
+Die Muster beziehen sich auf Bilddateinamen; originale Aufnahmen nicht ausschließen.
+
+Mit `MARKERPRUEFUNG=true` gelten die konfigurierten Mindestzahlen von Markern,
+Beobachtungen und akzeptierten Bildern. `STABILITAET_MAX_RMS_PX` vergleicht
+die erkannten Ecken mit ihrem zeitlichen Median. Das ist kein Referenz- oder
+Kalibrierungs-RMS. Die Standardgrenze von 1 Pixel muss zum Aufbau und zur
+Bildauflösung passen; sie sollte nicht allein zum Erzwingen eines Ergebnisses
+erhöht werden. Mindestens 70 Prozent der Eingaben müssen standardmäßig bestehen.
+Der Bericht nennt verworfene Bilder und Gründe.
+
+Ohne erfolgreiche Prüfung gibt es kein freigegebenes Mittelbild. Eine reine
+Pixelmittelung mit `MARKERPRUEFUNG=false` ist für Diagnosen möglich; sie belegt
+keine geometrische Stabilität und wird im Bericht gekennzeichnet. Solche Bilder
+nicht als erfolgreiche Markerprüfung ausgeben. Dauerhafte Unschärfe, Fokusdrift
+und falsche Kalibrierparameter werden durch Mittelung nicht korrigiert.
+
+Die lokale Serien-Config wird durch `.gitignore` ausgeschlossen. Prüfberichte
+und Mittelbilder bleiben lokal. Referenz-/Messpfade für das Rechenskript stehen
+nach erfolgreicher Mittelung in `processing_config_paths` des Ergebnis-dicts.
+
+## 11. Funktionen aus anderen Skripten aufrufen
+
+Module liegen neben dem aufrufenden Skript oder müssen im Python-Suchpfad
+verfügbar sein. Ein vollständiger Modulimport hält Funktionsnamen eindeutig:
+
+```python
+import aruco_serienmittelung
+import aruco_verarbeitung
+
+serien_config = aruco_serienmittelung.load_configuration("serien.config.local.json")
+serienbericht = aruco_serienmittelung.serien_auswerten(serien_config)
+if serienbericht["status"] != "ok":
+    raise RuntimeError("Keine freigegebenen Serienmittelbilder; Bericht prüfen.")
+
+mess_config = aruco_verarbeitung.load_configuration("config.local.json")
+mess_config.update(serienbericht["processing_config_paths"])
+messbericht = aruco_verarbeitung.run_pipeline(mess_config)
+```
+
+Das vollständige Beispiel ist auch als `pipeline_example.py` ausführbar.
+Diese APIs geben Ergebnis-dicts zurück. Bei fehlerhaften Grundeingaben können
+sie `ValueError`-Unterklassen auslösen; pro Serie/Bild auftretende Qualitätsfehler
+stehen zusätzlich im Bericht. Auch den Ergebnisstatus prüfen und verworfene
+Messwerte nicht weiterverwenden. Die Kopplung überschreibt nur die Eingabebilder
+der Höhen-Config; Kameraparameter, Geometrie und Ausgabeziel stammen weiterhin
+aus ihrer eigenen Config. Eine erfolgreiche Serienprüfung belegt noch keine
+korrekte Kalibrierung oder metrische Höhenmessung.
+
+Für eine einzelne Serie:
+
+```python
+import aruco_serienmittelung
+
+config = aruco_serienmittelung.load_configuration("serien.config.local.json")
+bericht = aruco_serienmittelung.mittel_bildserie(
+    config["REFERENZ_ORDNER"], "referenz_gemittelt.png", kind="referenz", config=config
+)
+```
+
+Direkte relative Ein-/Ausgabepfade dieser Einzelserien-API beziehen sich auf
+den Modulordner. Durch den JSON-Lader geladene Ordner sind bereits absolut und
+beziehen sich auf den Ort der Config. `main(argv)` ist der CLI-Einstieg;
+für die Integration die fachlichen Funktionen statt `main()` verwenden.
+Auch `calibrate_charuco` verwendet intern `import calibration_spatial` und
+qualifizierte Aufrufe wie `calibration_spatial.compute_spatial_quality(...)`.

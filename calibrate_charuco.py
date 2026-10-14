@@ -40,9 +40,9 @@ except ImportError as exc:
     raise SystemExit("Abhaengigkeiten fehlen: python -m pip install -r requirements.txt") from exc
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
-from calibration_spatial import compute_spatial_quality, spatial_options, write_spatial_outputs
+import calibration_spatial
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 
 def calibrated_detection_supported():
@@ -301,7 +301,7 @@ def validate_images(paths, board, fit, size, min_corners, training_paths, spatia
         row.update(status="validated", rms_px=rms)
     report = {"images_used": count, "rms_px": float(np.sqrt(np.mean(errors))) if errors else None,
               "views": rows, "note": "Intrinsische Parameter fixiert; pro Bild Pose angepasst. Kein Test der metrischen Hoehengenauigkeit."}
-    report["spatial_quality"] = compute_spatial_quality(accepted, size,
+    report["spatial_quality"] = calibration_spatial.compute_spatial_quality(accepted, size,
         dict(matrix=fit["matrix"], distortion=fit["distortion"], rvecs=rvecs, tvecs=tvecs),
         source="validation", **(spatial or {}))
     return report
@@ -317,10 +317,10 @@ def write_csv(path, rows):
 
 def save_calibration(output, board, fit, size, views, rows, args, quality, history, validation):
     matrix, distortion = fit["matrix"], fit["distortion"]
-    spatial_report = compute_spatial_quality(views, size, fit, **spatial_options(args))
-    write_spatial_outputs(output, spatial_report)
+    spatial_report = calibration_spatial.compute_spatial_quality(views, size, fit, **calibration_spatial.spatial_options(args))
+    calibration_spatial.write_spatial_outputs(output, spatial_report)
     if validation is not None:
-        write_spatial_outputs(output, validation["spatial_quality"], "validation_spatial_quality")
+        calibration_spatial.write_spatial_outputs(output, validation["spatial_quality"], "validation_spatial_quality")
     np.savez_compressed(output / "camera_calibration.npz", camera_matrix=matrix,
                         dist_coeffs=distortion, image_size=np.array(size, dtype=np.int32),
                         rms_px=np.array(fit["rms"]))
@@ -565,7 +565,7 @@ def main(argv=None):
         for model in (("standard", "fix_k3") if args.model == "compare" else (training_model,)):
             candidate = fit if model == training_model else fit_camera(views, size, model)
             checked = validate_images(validation_paths, board, candidate, size, args.min_corners,
-                                      set(paths), spatial_options(args), (cached_views, cached_rows))
+                                      set(paths), calibration_spatial.spatial_options(args), (cached_views, cached_rows))
             if checked["images_used"] == 0:
                 raise RuntimeError("Kein geeignetes Validierungsbild gefunden; Ordner / Board pruefen.")
             if args.model == "compare" and checked["images_used"] != len(cached_views):

@@ -13,6 +13,7 @@ __pycache__/
 .vscode/
 .idea/
 config.local.*
+*.config.local.json
 
 # Camera inputs, parameters and measurement outputs
 calib/
@@ -22,6 +23,7 @@ images/
 calibration/
 results/
 ergebnisse*/
+serien_ergebnisse/
 AUSWERTUNG.md
 *.npy
 *.npz
@@ -41,3 +43,11 @@ konfiguration.json
 lauf.json
 summary.txt
 zusammenfassung.txt
+bericht.json
+bericht.txt
+*mittelung_bericht.json
+ablage_und_pruefung.json
+diagnose_messserie.json
+model_comparison.json
+spatial_quality.json
+validation_spatial_quality.json
