@@ -106,6 +106,7 @@ class ReferenceGuardTests(unittest.TestCase):
         engine = live.LiveAnalyzer.__new__(live.LiveAnalyzer)
         engine.size = (640, 480)
         engine.min_ref = 3
+        engine.require_reference_control = True
         engine.base_pose = object()
         engine.detectors = object()
         engine.spec_map = {}
