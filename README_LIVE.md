@@ -135,3 +135,30 @@ Sinnvolle `.gitignore`-Einträge:
 live.config.local.json
 live_aufnahmen/
 ```
+
+
+## Starres Messraster und Referenzbild ohne sichtbare Referenzen
+
+Das Messraster wird in der **Verarbeitungs-Config** konfiguriert, nicht in der Live-Config.
+`MESSMODELL: "gemeinsame_ebene"`, `MESSGRUPPEN` und `MESS_LAYOUTS` koennen
+relative Markerpositionen oder Abstaende festlegen. Details und JSON-Beispiel
+stehen in [README.md](README.md#vermessenes-messraster-ab-version-230).
+
+Soll die Pose ausschliesslich aus dem Referenzbild stammen und keine Referenzmarker
+im aktuellen Livebild erforderlich sein, in `config.local.json` setzen:
+
+```json
+{"REFERENZPOSE_MODUS": "fest"}
+```
+
+Und in `live.config.local.json` setzen:
+
+```json
+{"REFERENZ_START": "bild", "REFERENZ_KONTROLLE_IM_MESSBILD": false}
+```
+
+Die Referenz-RMS-Kontrolle des Livebildes ist dann deaktiviert. Das Overlay
+zeigt `FEST / UNGEPRUEFT` statt einer gruener Referenzfreigabe. Solange
+die Kamera nicht absolut stabil und unveraendert ist, kann ein fester Bezug
+zu systematisch falschen Hoehen fuehren.
+
