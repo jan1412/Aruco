@@ -113,6 +113,7 @@ CONFIG = {'REFERENZBILD': None,
  'REFERENZ_HOEHEN_MM': {},
  'MESSMODELL': 'einzelmarker',
  'MESSGRUPPEN': {},
+ 'MESS_LAYOUTS': {},  # Optional: starre XY-Geometrie je Messgruppe
  'MIN_MARKER_PRO_MESSEBENE': 2,
  'MESSEBENE_MAX_EINZELHOEHENSPANNE_MM': None,
  'MESS_OPTIMIERUNG_LOSS': 'linear',
@@ -138,7 +139,7 @@ CONFIG = {'REFERENZBILD': None,
  'CSV_DEZIMALKOMMA': True}
 # ===================== ENDE KONFIGURATION =====================
 
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -303,6 +304,7 @@ def build_specs(config):
         raise ProcessingError("KONTROLLKORREKTUR_MIN_MARKER muss positiv sein.")
     if config.get("KONTROLLKORREKTUR_MODUS") == "offset" and len(control_ids) < minimum_control:
         raise ProcessingError("Offsetkorrektur braucht ausreichend ausdruecklich gewaehlte Kontroll-IDs.")
+    build_measurement_layouts(config, specs)  # Layouts vor der eigentlichen Messung pruefen.
     return specs
 
 
@@ -776,16 +778,21 @@ def invalidate_heights(records, message):
         record.update(status="error", error=message)
 
 
-def fit_measurement_planes(records, spec_map, pose, K, D, config):
-    """Fit one common z and independent x/y/yaw values using all group corners."""
+def fit_measurement_planes(records, spec_map, pose, K, D, config, layouts=None):
+    """Fit gemeinsame Ebene; optional starres Messlayout mit bekannten XY-Abstaenden."""
+    if layouts is None:
+        layouts = build_measurement_layouts(config, list(spec_map.values()))
     if config.get("MESSMODELL", "einzelmarker") == "einzelmarker":
         return []
     reports = []
     for name, ids in config["MESSGRUPPEN"].items():
         present = [r for r in records if r["role"] == "measurement" and r["id"] in ids]
         members = [r for r in present if r["status"] == "ok"]
+        layout = layouts.get(name)
         report = dict(name=name, configured_ids=list(ids), used_ids=[r["id"] for r in members],
-                      normal_ground=[0., 0., 1.], status="error")
+                      normal_ground=[0., 0., 1.], status="error",
+                      layout_mode=layout["mode"] if layout else "frei",
+                      rigid_layout=bool(layout))
         reports.append(report)
         for record in present:
             record["measurement_plane"] = name
@@ -798,6 +805,12 @@ def fit_measurement_planes(records, spec_map, pose, K, D, config):
             span = float(np.ptp(individual))
             report["individual_height_span_mm"] = span
             check_limit(span, config.get("MESSEBENE_MAX_EINZELHOEHENSPANNE_MM"), "Einzelhoehen einer Messebene")
+            if layout:
+                report.update(fit_rigid_measurement_layout(
+                    members, layout, spec_map, pose, K, D, config, name))
+                report["status"] = "ok"
+                report["max_distance_deviation_mm"] = layout["max_distance_deviation_mm"]
+                continue
             initial = [float(np.median(individual))]
             locals_ = []
             for record in members:
@@ -840,6 +853,162 @@ def fit_measurement_planes(records, spec_map, pose, K, D, config):
             report["error"] = str(exc)
             invalidate_heights(present, str(exc))
     return reports
+
+
+
+def build_measurement_layouts(config, specs):
+    """Optionale starre XY-Geometrie pro MESSGRUPPEN-Gruppe (Millimeter).
+
+    Layout-Positionen beschreiben ein mitbewegtes lokales Koordinatensystem,
+    NICHT feste Weltkoordinaten. Der globale Fit bestimmt x, y, z und yaw.
+    """
+    definitions = config.get("MESS_LAYOUTS", {})
+    if not isinstance(definitions, dict):
+        raise ProcessingError("MESS_LAYOUTS muss ein Objekt mit Gruppennamen sein.")
+    if definitions and config.get("MESSMODELL") != "gemeinsame_ebene":
+        raise ProcessingError("MESS_LAYOUTS erfordert MESSMODELL='gemeinsame_ebene'.")
+    groups = config.get("MESSGRUPPEN", {})
+    if set(definitions) - set(groups):
+        raise ProcessingError("MESS_LAYOUTS enthaelt unbekannte MESSGRUPPEN.")
+    allowed = {"modus", "positionen_mm", "raster_ids", "abstand_x_mm",
+               "abstand_y_mm", "abstaende_mm", "ursprung_id", "x_achse_id",
+               "y_seite_id", "y_seite_vorzeichen", "max_abweichung_mm",
+               "winkel_grad"}
+    layouts = {}
+    for name, definition in definitions.items():
+        if not isinstance(definition, dict) or set(definition) - allowed:
+            raise ProcessingError(f"MESS_LAYOUTS[{name}]: ungueltige/ unbekannte Felder.")
+        ids = list(groups[name])
+        mode = definition.get("modus")
+        if mode not in ("positionen", "raster", "abstaende"):
+            raise ProcessingError(f"MESS_LAYOUTS[{name}].modus: positionen, raster oder abstaende.")
+        positions = {}
+        deviation = 0.
+        if mode == "positionen":
+            raw = definition.get("positionen_mm", {})
+            if not isinstance(raw, dict) or set(raw) != set(ids):
+                raise ProcessingError(f"MESS_LAYOUTS[{name}].positionen_mm muss jede Gruppen-ID enthalten.")
+            for marker_id, xy in raw.items():
+                value = np.asarray(xy, dtype=np.float64)
+                if value.shape != (2,) or not np.isfinite(value).all():
+                    raise ProcessingError(f"MESS_LAYOUTS[{name}], ID {marker_id}: zwei endliche XY-Werte erwartet.")
+                positions[marker_id] = value
+        elif mode == "raster":
+            grid = definition.get("raster_ids", [])
+            if (not isinstance(grid, (tuple, list)) or not grid
+                    or any(not isinstance(row, (tuple, list)) or not row
+                           or len(row) != len(grid[0]) for row in grid)):
+                raise ProcessingError(f"MESS_LAYOUTS[{name}].raster_ids: rechteckiges Raster erwartet.")
+            flat = [item for row in grid for item in row]
+            if len(set(flat)) != len(flat) or set(flat) != set(ids):
+                raise ProcessingError(f"MESS_LAYOUTS[{name}]: Raster muss alle Gruppen-IDs genau einmal enthalten.")
+            dx = finite_number(definition.get("abstand_x_mm"), f"Raster {name} dx", positive=True)
+            dy = finite_number(definition.get("abstand_y_mm"), f"Raster {name} dy", positive=True)
+            positions = {marker_id: np.array([col * dx, -row * dy], dtype=np.float64)
+                         for row, entries in enumerate(grid)
+                         for col, marker_id in enumerate(entries)}
+        else:
+            distances = definition.get("abstaende_mm", [])
+            if not isinstance(distances, (tuple, list)):
+                raise ProcessingError(f"MESS_LAYOUTS[{name}].abstaende_mm: Liste erwartet.")
+            if len(ids) == 2:
+                if (len(distances) != 1 or len(distances[0]) != 3
+                        or set(distances[0][:2]) != set(ids)):
+                    raise ProcessingError(f"MESS_LAYOUTS[{name}]: zwei IDs brauchen genau einen Paarabstand.")
+                distance = finite_number(distances[0][2], f"Abstand {name}", positive=True)
+                origin = definition.get("ursprung_id", ids[0])
+                axis = definition.get("x_achse_id", next(i for i in ids if i != origin))
+                if {origin, axis} != set(ids):
+                    raise ProcessingError(f"MESS_LAYOUTS[{name}]: Ursprung/X-Achse passen nicht zur Gruppe.")
+                positions = {origin: np.array([0., 0.]), axis: np.array([distance, 0.])}
+            else:
+                translated = {
+                    "REFERENZ_IDS": ids,
+                    "REFERENZ_ABSTAENDE_MM": distances,
+                    "REFERENZ_URSPRUNG_ID": definition.get("ursprung_id"),
+                    "REFERENZ_X_ACHSE_ID": definition.get("x_achse_id"),
+                    "REFERENZ_Y_SEITE_ID": definition.get("y_seite_id"),
+                    "REFERENZ_Y_SEITE_VORZEICHEN": definition.get("y_seite_vorzeichen", -1),
+                    "GEOMETRIE_MAX_ABWEICHUNG_MM": definition.get("max_abweichung_mm", .5),
+                }
+                positions, deviation = layout_from_distances(translated)
+        # Ein starres 2D-Raster muss mindestens zwei verschiedene Punkte haben.
+        if any(np.linalg.norm(positions[a] - positions[b]) < 1e-8
+               for a, b in combinations(ids, 2)):
+            raise ProcessingError(f"MESS_LAYOUTS[{name}]: Markerzentren duerfen nicht identisch sein.")
+        angles = definition.get("winkel_grad", {})
+        if not isinstance(angles, dict) or set(angles) - set(ids):
+            raise ProcessingError(f"MESS_LAYOUTS[{name}].winkel_grad: nur Gruppen-IDs erlaubt.")
+        angles = {i: math.radians(finite_number(angles.get(i, 0.),
+                                               f"Messmarker-Winkel {name}:{i}")) for i in ids}
+        layouts[name] = {"mode": mode, "positions": positions, "angles_rad": angles,
+                         "max_distance_deviation_mm": deviation}
+    return layouts
+
+
+def fit_rigid_measurement_layout(members, layout, spec_map, pose, K, D, config, group_name):
+    """Fit eines starren, zur Grundebene parallelen Messrasters.
+
+    Vier Freiheitsgrade: x/y-Verschiebung, z-Hoehe, Drehung in der Grundebene.
+    Die relativen XY-Positionen und Markerwinkel sind feste Messdaten.
+    """
+    locals_ = []
+    for record in members:
+        marker_id = record["id"]
+        spec = spec_map[(record["dictionary"], marker_id)]
+        local = square_corners(spec.size_mm) @ rotation_z(layout["angles_rad"][marker_id]).T
+        center = layout["positions"][marker_id]
+        locals_.append(local + np.array([center[0], center[1], 0.]))
+
+    def points_world(parameters, i):
+        return (locals_[i] @ rotation_z(parameters[3]).T
+                + np.array([parameters[0], parameters[1], parameters[2]]))
+
+    def residual(parameters):
+        return np.concatenate([
+            (project(points_world(parameters, i), pose.rvec, pose.tvec, K, D)
+             - record["corners_px"]).ravel()
+            for i, record in enumerate(members)
+        ])
+
+    # Die bisherige Einzelmarkerpose ist der Startwert, kein Zwang.
+    initial_yaws = [math.radians(r["rotation_in_ground_plane_deg"])
+                    - layout["angles_rad"][r["id"]] for r in members]
+    yaw = math.atan2(np.mean(np.sin(initial_yaws)), np.mean(np.cos(initial_yaws)))
+    translation = np.mean([
+        r["position_ground_mm"][:2]
+        - (rotation_z(yaw) @ np.r_[layout["positions"][r["id"]], 0.])[:2]
+        for r in members
+    ], axis=0)
+    initial = [translation[0], translation[1],
+               float(np.median([r["height_raw_mm"] for r in members])), yaw]
+    fit = least_squares(residual, initial, method="trf", x_scale="jac",
+                        loss=config.get("MESS_OPTIMIERUNG_LOSS", "linear"),
+                        f_scale=config.get("MESS_ROBUST_SKALA_PX", 1.))
+    if not fit.success or not np.isfinite(fit.x).all():
+        raise ProcessingError(f"Messraster {group_name}: starre Optimierung fehlgeschlagen.")
+    errors = residual(fit.x).reshape(len(members), 4, 2)
+    rms_values = np.sqrt(np.mean(np.sum(errors ** 2, axis=2), axis=1))
+    for index, rms in enumerate(rms_values):
+        camera_points = points_world(fit.x, index) @ pose.R.T + pose.tvec.reshape(3)
+        if np.any(camera_points[:, 2] <= 0):
+            raise ProcessingError(f"Messraster {group_name}: Punkte hinter der Kamera.")
+        check_limit(float(rms), config["MESS_MAX_RMS_PX"],
+                    f"Messraster {group_name}, ID {members[index]['id']}")
+    for index, record in enumerate(members):
+        center = np.r_[layout["positions"][record["id"]], 0.]
+        center_ground = rotation_z(fit.x[3]) @ center + fit.x[:3]
+        angle = fit.x[3] + layout["angles_rad"][record["id"]]
+        record.update(position_ground_mm=center_ground, height_raw_mm=float(fit.x[2]),
+                      height_mm=float(fit.x[2] - record["zero_mm"]),
+                      rotation_in_ground_plane_deg=(math.degrees(angle)+180) % 360-180,
+                      reprojection_rms_px=float(rms_values[index]),
+                      rvec_marker_to_camera=cv2.Rodrigues(pose.R @ rotation_z(angle))[0].reshape(3),
+                      tvec_marker_to_camera_mm=pose.R @ center_ground + pose.tvec.reshape(3),
+                      rigid_layout=True)
+    return {"height_raw_mm": float(fit.x[2]), "angle_deg": math.degrees(fit.x[3]),
+            "translation_xy_mm": fit.x[:2],
+            "reprojection_rms_px": float(np.sqrt(np.mean(np.sum(errors ** 2, axis=2))))}
 
 
 def initialize_height_controls(records, config):
@@ -1102,6 +1271,7 @@ def run_pipeline(config=None):
         if not config.get(key):
             raise ProcessingError(f"CONFIG[{key!r}] fehlt. Bitte lokale Eingaben konfigurieren.")
     specs = build_specs(config)
+    measurement_layouts = build_measurement_layouts(config, specs)
     spec_map = {s.key: s for s in specs}
     geometry, geometry_details = build_reference_geometry(config, specs)
     K, D, image_size = load_calibration(config)
@@ -1173,7 +1343,7 @@ def run_pipeline(config=None):
                 records = analyze_observations(observations, spec_map, pose, K, D, config)
                 initialize_height_controls(records, config)
                 apply_zero_levels(records, levels)
-                planes = fit_measurement_planes(records, spec_map, pose, K, D, config)
+                planes = fit_measurement_planes(records, spec_map, pose, K, D, config, measurement_layouts)
                 reference_error = apply_reference_quality(records, control, config)
                 height_control = (apply_height_controls(records, config) if not reference_error else
                                   dict(status="blocked", error=reference_error))
@@ -1220,7 +1390,9 @@ def run_pipeline(config=None):
         plane_rows = [dict(bild=str(report["image"]), gruppe=plane["name"], status=plane["status"],
             ids=",".join(str(i) for i in plane["used_ids"]), hoehe_mm=plane.get("height_mm"),
             z_roh_mm=plane.get("height_raw_mm"), diagnostische_rohhoehe_mm=plane.get("diagnostic_height_raw_mm"),
-            rms_px=plane.get("reprojection_rms_px"), einzelhoehen_spanne_mm=plane.get("individual_height_span_mm"),
+            rms_px=plane.get("reprojection_rms_px"), layout=plane.get("layout_mode"),
+            messraster_starr=plane.get("rigid_layout"),
+            einzelhoehen_spanne_mm=plane.get("individual_height_span_mm"),
             hinweise=plane.get("height_note", ""), fehler=plane.get("error", report.get("error", "")))
             for report in reports for plane in report.get("measurement_planes", [])]
         if plane_rows:
@@ -1235,6 +1407,10 @@ def run_pipeline(config=None):
                    "zero_levels": [{"dictionary": key[0], "id": key[1], "zero_mm": v[0], "source": v[1]}
                                    for key, v in levels.items()],
                    "measurement_model": config.get("MESSMODELL", "einzelmarker"),
+                   "measurement_layouts": {name: {"mode": data["mode"], "positions_mm": data["positions"],
+                                          "angles_deg": {str(i): math.degrees(a)
+                                                         for i, a in data["angles_rad"].items()}}
+                                           for name, data in measurement_layouts.items()},
                    "images_total": len(reports), "valid_measurements": sum(r["status"] == "ok" and r["rolle"] == "measurement" for r in rows),
                    "images_error": sum(r["status"] == "error" for r in reports),
                    "images_incomplete": sum(r["status"] != "ok" for r in reports),
@@ -1278,6 +1454,24 @@ def load_configuration(path):
             if len(converted) != len(value):
                 raise ProcessingError(f"{key}: mehrfach angegebene Marker-ID.")
             value = converted
+        if key == "MESS_LAYOUTS":
+            if not isinstance(value, dict):
+                raise ProcessingError("MESS_LAYOUTS muss ein Objekt sein.")
+            converted_layouts = {}
+            for group, layout in value.items():
+                if not isinstance(layout, dict):
+                    raise ProcessingError("MESS_LAYOUTS: jede Gruppe muss ein Objekt sein.")
+                converted = dict(layout)
+                for subkey in ("positionen_mm", "winkel_grad"):
+                    if subkey in converted:
+                        original = converted[subkey]
+                        if not isinstance(original, dict) or any(not str(i).isdigit() for i in original):
+                            raise ProcessingError(f"MESS_LAYOUTS[{group}].{subkey}: numerische Marker-ID-Schluessel erwartet.")
+                        converted[subkey] = {int(i): val for i, val in original.items()}
+                        if len(converted[subkey]) != len(original):
+                            raise ProcessingError("Doppelte Marker-ID im Messlayout.")
+                converted_layouts[group] = converted
+            value = converted_layouts
         config[key] = value
     for key in ("REFERENZBILD", "AUSGABEORDNER", "KAMERAMATRIX_DATEI", "VERZEICHNUNG_DATEI"):
         if key in overrides and config[key] is not None:
