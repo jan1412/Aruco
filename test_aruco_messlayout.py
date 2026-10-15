@@ -52,7 +52,8 @@ class MeasurementLayoutTests(unittest.TestCase):
         layout = calc.build_measurement_layouts(config, specs)["oberflaeche"]
         observations = []
         for spec in specs:
-            if spec.role != "measurement" or (subset is not None and spec.marker_id not in subset):
+            if (spec.role != "measurement" or spec.marker_id not in layout["positions"]
+                    or (subset is not None and spec.marker_id not in subset)):
                 continue
             center = layout["positions"][spec.marker_id]
             local = calc.square_corners(spec.size_mm)
@@ -127,7 +128,7 @@ class MeasurementLayoutTests(unittest.TestCase):
 
     def test_bad_known_distance_must_reject(self):
         cfg = copy.deepcopy(self.config)
-        cfg["MESS_LAYOUTS"]["oberflaeche"]["abstand_x_mm"] = 90.
+        cfg["MESS_LAYOUTS"]["oberflaeche"]["abstand_x_mm"] = 125.
         records, planes = self.process(cfg)
         self.assertEqual(planes[0]["status"], "error")
         self.assertFalse(any("height_mm" in rec for rec in records))
