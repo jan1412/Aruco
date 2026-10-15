@@ -1,0 +1,25 @@
+{
+  "VERARBEITUNGS_CONFIG": "config.local.json",
+  "AUSGABEORDNER": "live_aufnahmen",
+  "REFERENZ_START": "live",
+  "BERECHNUNGEN_PRO_SEKUNDE": 2.0,
+  "ANZEIGE_MAX_BREITE_PX": 1600,
+  "MIN_SICHTBARE_REFERENZEN": null,
+  "CONTINUOUS_CSV": false,
+  "KAMERA": {
+    "INDEX": 0,
+    "BACKEND": "DSHOW",
+    "BREITE": 3840,
+    "HOEHE": 2160,
+    "FPS": 30,
+    "FOURCC": "MJPG",
+    "PUFFERGROESSE": 1,
+    "AUTO_FOKUS": null,
+    "FOKUS": null,
+    "AUTO_BELICHTUNG": null,
+    "BELICHTUNG": null,
+    "AUTO_WEISSABGLEICH": null,
+    "WEISSABGLEICH_K": null
+  },
+  "MAX_ANZEIGEALTER_S": 2.0
+}
