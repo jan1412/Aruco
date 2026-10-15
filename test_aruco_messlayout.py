@@ -69,8 +69,11 @@ class MeasurementLayoutTests(unittest.TestCase):
                                  "corners_px": corners})
         return config, mapping, observations
 
-    def process(self, config=None, height=15., yaw=.3, noise=0.0, subset=None):
-        config, mapping, observations = self.synthesize(config, height, yaw, noise, subset)
+    def process(self, config=None, height=15., yaw=.3, noise=0.0, subset=None,
+                source_config=None):
+        # Physikalischer Aufbau (Quelle) kann vom eingestellten Messraster abweichen.
+        config = config or self.config
+        _, mapping, observations = self.synthesize(source_config or config, height, yaw, noise, subset)
         records = calc.analyze_observations(observations, mapping, self.pose, self.K, self.D, config)
         levels = {key: (0., "test") for key in mapping
                   if mapping[key].role == "measurement"}
@@ -129,7 +132,9 @@ class MeasurementLayoutTests(unittest.TestCase):
     def test_bad_known_distance_must_reject(self):
         cfg = copy.deepcopy(self.config)
         cfg["MESS_LAYOUTS"]["oberflaeche"]["abstand_x_mm"] = 125.
-        records, planes = self.process(cfg)
+        # Bilder stammen weiter aus dem korrekt vermessenen 80-mm-Aufbau.
+        # Nur die vom Algorithmus angenommene Geometrie ist falsch.
+        records, planes = self.process(cfg, source_config=self.config)
         self.assertEqual(planes[0]["status"], "error")
         self.assertFalse(any("height_mm" in rec for rec in records))
 
