@@ -41,6 +41,7 @@ CONFIG = {
     "ANZEIGE_MAX_BREITE_PX": 1600,      # lediglich die Vorschau skalieren
     "MAX_ANZEIGEALTER_S": 2.0,          # alte Analyse nicht weiter als gueltig markieren
     "MIN_SICHTBARE_REFERENZEN": None,  # None = MIN_REFERENZMARKER aus Berechnung
+    "REFERENZ_KONTROLLE_IM_MESSBILD": True,  # False: feste Bildpose ohne sichtbare Referenzmarker
     "CONTINUOUS_CSV": False,
     "KAMERA": {
         "INDEX": 0,
@@ -166,7 +167,8 @@ def get_visible(observations):
     }
 
 
-def quality_summary(report, expected_ref, expected_mess, expected_controls, minimum, warn, limit):
+def quality_summary(report, expected_ref, expected_mess, expected_controls, minimum, warn, limit,
+                    reference_control_active=True, fixed_reference=False):
     records = report.get("markers", [])
     visible = get_visible(records)
     n_ref = len(visible["reference"])
@@ -179,6 +181,8 @@ def quality_summary(report, expected_ref, expected_mess, expected_controls, mini
     # kein Nachweis einer Messgenauigkeit in mm.
     if report.get("status") == "no_reference":
         quality = "NICHT INITIALISIERT"
+    elif not reference_control_active and fixed_reference:
+        quality = "FEST / UNGEPRUEFT"
     elif n_ref < minimum:
         quality = "NICHT PRUEFBAR"
     elif rms is None or not math.isfinite(rms):
@@ -198,6 +202,8 @@ def quality_summary(report, expected_ref, expected_mess, expected_controls, mini
         "control_visible": n_controls, "control_total": expected_controls,
         "measurement_valid": valid, "reference_rms_px": rms,
         "reference_quality": quality, "warning_rms_px": warn, "maximum_rms_px": limit,
+        "reference_control_active": reference_control_active,
+        "fixed_reference": fixed_reference,
     }
 
 
@@ -205,6 +211,11 @@ class LiveAnalyzer:
     def __init__(self, config):
         self.config = config
         self.pc = calc.load_configuration(config["VERARBEITUNGS_CONFIG"])
+        self.require_reference_control = config.get("REFERENZ_KONTROLLE_IM_MESSBILD", True)
+        if type(self.require_reference_control) is not bool:
+            raise ValueError("REFERENZ_KONTROLLE_IM_MESSBILD muss true oder false sein.")
+        if not self.require_reference_control and self.pc["REFERENZPOSE_MODUS"] != "fest":
+            raise ValueError("REFERENZ_KONTROLLE_IM_MESSBILD=false braucht REFERENZPOSE_MODUS='fest'.")
         self.specs = calc.build_specs(self.pc)
         self.spec_map = {s.key: s for s in self.specs}
         self.geometry, _ = calc.build_reference_geometry(self.pc, self.specs)
@@ -267,7 +278,9 @@ class LiveAnalyzer:
         summary = quality_summary(report, self.ref_count, self.mess_count,
                                   self.ctrl_count, self.min_ref,
                                   self.pc.get("REF_KONTROLLE_WARN_RMS_PX"),
-                                  self.pc.get("REF_KONTROLLE_MAX_RMS_PX"))
+                                  self.pc.get("REF_KONTROLLE_MAX_RMS_PX"),
+                                  reference_control_active=self.require_reference_control,
+                                  fixed_reference=self.pc["REFERENZPOSE_MODUS"] == "fest")
         seen_refs = {r["id"] for r in report.get("markers", [])
                      if r.get("role") == "reference"}
         seen_mess = {r["id"] for r in report.get("markers", [])
@@ -287,16 +300,26 @@ class LiveAnalyzer:
             report["error"] = "Noch keine Referenz: Taste R druecken."
             return report
         visible_refs = get_visible(obs)["reference"]
-        if len(visible_refs) < self.min_ref:
+        if self.require_reference_control and len(visible_refs) < self.min_ref:
             report["status"] = "error"
             report["error"] = (f"Zu wenige sichtbare Referenzmarker: "
                                f"{len(visible_refs)}/{self.min_ref}. Hoehen gesperrt.")
             return report
         try:
-            pose, control = calc.select_reference_pose(
-                obs, self.base_pose, self.geometry, self.K, self.D,
-                self.pc, enforce_quality=False
-            )
+            if self.require_reference_control:
+                pose, control = calc.select_reference_pose(
+                    obs, self.base_pose, self.geometry, self.K, self.D,
+                    self.pc, enforce_quality=False
+                )
+            else:
+                # Keine Referenzgeometrie oder RMS-Pruefung aus dem Messbild;
+                # die Referenzpose wurde zuvor aus dem Referenzbild geladen.
+                pose = self.base_pose
+                control = {"visible_reference_ids": [],
+                           "control_rms_px": None, "control_available": False}
+                report["warnings"].append(
+                    "Feste Referenzpose aus Referenzbild: Kamerabewegung nicht pruefbar."
+                )
             report["reference_pose"] = pose.as_dict()
             report["reference_control"] = control
             records = calc.analyze_observations(obs, self.spec_map, pose, self.K, self.D, self.pc)
@@ -304,7 +327,8 @@ class LiveAnalyzer:
             calc.apply_zero_levels(records, self.null_levels)
             planes = calc.fit_measurement_planes(records, self.spec_map, pose,
                                                   self.K, self.D, self.pc)
-            reference_error = calc.apply_reference_quality(records, control, self.pc)
+            reference_error = (calc.apply_reference_quality(records, control, self.pc)
+                               if self.require_reference_control else None)
             height_controls = (calc.apply_height_controls(records, self.pc)
                                if reference_error is None
                                else {"status": "blocked", "error": reference_error})
@@ -370,7 +394,7 @@ class LiveAnalyzer:
 def status_color(quality, status):
     if status in ("error", "no_reference") or quality in ("UNGUELTIG", "NICHT PRUEFBAR"):
         return (55, 70, 230)  # BGR rot
-    if quality == "WARNUNG" or status in ("partial", "no_measurements"):
+    if quality in ("WARNUNG", "FEST / UNGEPRUEFT") or status in ("partial", "no_measurements"):
         return (40, 190, 245)  # gelb
     return (70, 205, 85)  # gruen
 
@@ -388,8 +412,12 @@ def draw_overlay(frame, report, summary, age, max_width, max_age=2.0):
     stale = age > max_age
     main_color = ((120, 120, 200) if stale else
                   status_color(summary["reference_quality"], report["status"]))
-    reference_text = (f"Referenz: {summary['reference_visible']}/{summary['reference_total']} "
-                      f"(min. {summary['reference_minimum']}) | {summary['reference_quality']}")
+    if summary.get("reference_control_active", True):
+        reference_text = (f"Referenz: {summary['reference_visible']}/{summary['reference_total']} "
+                          f"(min. {summary['reference_minimum']}) | {summary['reference_quality']}")
+    else:
+        reference_text = ("Referenz: FEST AUS REFERENZBILD | Kontrolle AUS "
+                          f"| sichtbar: {summary['reference_visible']}/{summary['reference_total']}")
     rms = summary["reference_rms_px"]
     rms_text = "---" if rms is None else f"{rms:.3f} px"
     warn, limit = summary.get("warning_rms_px"), summary.get("maximum_rms_px")
@@ -402,6 +430,8 @@ def draw_overlay(frame, report, summary, age, max_width, max_age=2.0):
         (f"Messmarker sichtbar: {summary['measurement_visible']}/{summary['measurement_total']} | "
          f"Hoehen gueltig: {summary['measurement_valid']}/{summary['measurement_total']}"),
     ]
+    if not summary.get("reference_control_active", True):
+        lines.append("ACHTUNG: Referenzpose nicht aus Messbild kontrolliert; Kamera muss starr bleiben.")
     if summary["control_total"]:
         lines.append(f"Hoehenkontrollen: {summary['control_visible']}/{summary['control_total']}")
     for title, key in (("Fehlende REF-IDs", "missing_reference_ids"),
