@@ -122,6 +122,28 @@ Spalte leer; berechnete Werte werden ausdrücklich als ungültige Diagnose in
 zusätzlich in den Berichten. Exitcode 0 bedeutet vollständige Auswertung,
 1 einen Startfehler und 2 mindestens ein unvollständiges oder verworfenes Bild.
 
+## Live-Hoehenmessung mit USB-Kamera
+
+Das optionale [Live-Addon](README_LIVE.md) verarbeitet kontinuierlich Frames einer
+USB-Kamera, z. B. der Insta360 Link 2 Pro. Es verwendet dieselben
+Marker- und Hoehenmodelle wie `aruco_verarbeitung.py` und zeigt im Kamerabild
+Marker-IDs, Hoehen, Referenz-RMS, Sichtbarkeit und Qualitaetswarnungen an.
+Mit `R` wird eine Referenzaufnahme erstellt, mit `S` ein Messfoto mit
+Auswertung und mit `F` ein Foto aus dem Videostream gespeichert.
+
+```powershell
+Copy-Item live.config.example.json live.config.local.json
+python aruco_live.py --probe 5 --backend DSHOW
+python aruco_live.py --config live.config.local.json
+```
+
+Die bestehende `config.local.json` muss vorher fuer Marker und Kalibrierung
+eingerichtet sein. Die Live-Kameraauflösung muss zur Kalibrierung passen.
+Unveraenderte Originalframes werden fuer Berechnung und PNG-Messfoto verwendet;
+nur die Vorschau wird fuer die Anzeige skaliert. Qualitaetsstatus beruht auf
+konfigurierten Pixel-Reprojektionsfehlern, nicht auf nachgewiesener
+Millimeter-Messgenauigkeit. Details: [README_LIVE.md](README_LIVE.md).
+
 ## Serienmittelung
 
 `aruco_serienmittelung.py` mittelt eine Referenzserie und getrennte Messserien.
