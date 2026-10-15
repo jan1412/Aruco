@@ -225,3 +225,97 @@ Technische Grundlage:
 [OpenCV ChArUco](https://docs.opencv.org/4.x/df/d4a/tutorial_charuco_detection.html),
 [OpenCV Kamerakalibrierung](https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html),
 [OpenCV Poseberechnung](https://docs.opencv.org/4.x/d5/d1f/calib3d_solvePnP.html).
+
+
+## Vermessenes Messraster (ab Version 2.3.0)
+
+Optional kann die **relative Geometrie von Messmarkern auf einer gemeinsamen, starren
+und zur Referenzebene parallelen Messoberflaeche** bekanntgegeben werden. Anders
+als bei freien Einzelmarkerpositionen werden dann gemeinsame x/y-Verschiebung,
+z-Hoehe und In-Plane-Drehung des gesamten Markerverbandes an **allen sichtbaren
+Markerecken gleichzeitig** gefittet. Der bisherige Modus ohne Messlayout bleibt
+unveraendert.
+
+Beispiel: vier Messmarker, Mittelabstand 80 mm horizontal und 70 mm vertikal
+(alle Zahlen sind gemessene **Markerzentrum-zu-Markerzentrum**-Abstaende):
+
+```json
+{
+  "MESSMODELL": "gemeinsame_ebene",
+  "MESSGRUPPEN": {"oberflaeche": [20, 21, 22, 23]},
+  "MIN_MARKER_PRO_MESSEBENE": 2,
+  "MESS_LAYOUTS": {
+    "oberflaeche": {
+      "modus": "raster",
+      "raster_ids": [[20, 21], [22, 23]],
+      "abstand_x_mm": 80.0,
+      "abstand_y_mm": 70.0,
+      "winkel_grad": {"20": 0, "21": 0, "22": 0, "23": 0}
+    }
+  }
+}
+```
+
+Diesen Block zu `config.local.json` hinzufuegen, nicht in die Live-Config.
+`MESS_IDS` und `MESS_GROESSEN_MM`/`MESS_GROESSE_MM` muessen zu den
+tatsaechlichen Markern passen. JSON-ID-Schluessel werden beim Laden automatisch
+in Ganzzahlen umgesetzt. Jede Gruppe in `MESS_LAYOUTS` muss als
+`MESSGRUPPEN` existieren. Mehrere getrennte Oberflaechen koennen getrennte
+Layouts besitzen.
+
+Weitere Layout-Definitionen:
+
+- `"modus": "positionen"`: `"positionen_mm": {"20":[0,0], "21":[80,0], ...}`
+  fuer beliebige, vermessene XY-Markerzentren im **lokalen** Messraster.
+- `"modus": "abstaende"`: `"abstaende_mm": [[20,21,80.0], ...]`.
+  Bei drei oder mehr Markern sind **alle** Paarabstaende sowie
+  `ursprung_id`, `x_achse_id`, `y_seite_id` erforderlich (wie bei
+  Referenzabstaenden). Bei zwei Markern genuegt ihr einzelner Paarabstand.
+  `max_abweichung_mm` begrenzt die geometrische Widerspruechlichkeit.
+- `winkel_grad`: optionale gemessene Orientierung jedes Markers relativ zum
+  **lokalen** Raster; fehlende Winkel werden als 0 Grad angenommen.
+
+Die Referenz- und Messlayouts sind unabhaengig. Das Messraster darf als Ganzes
+verschoben und in der Referenzebene gedreht sein. Das Verfahren setzt aber
+**feste, starre Abstaende und eine gemeinsame parallele Ebene** voraus:
+Bei Bewegung einzelner Marker gegeneinander oder schiefen/gebogenen
+Oberflaechen ist das Rastermodell ungeeignet.
+
+Die zusaetzlichen Layoutbedingungen reduzieren mathematische Freiheitsgrade,
+garantieren jedoch **keine** bessere Hoehengenauigkeit. Schon kleine Fehler in
+den eingegebenen Abstaenden oder relativen Winkeln koennen systematische
+Hoehenfehler ausloesen. Das Reprojektions-RMS bleibt in den Berichten; zu
+grosse Fehler werden verworfen. Vor/nach Aktivierung mit bekannten
+Pruefhoehen und Wiederholmessungen vergleichen. `messebene.csv` kennzeichnet
+`layout` und `messraster_starr`.
+
+## Feste Referenzpose nur aus dem Referenzbild
+
+Fuer das **Offline-Rechenskript** in `config.local.json` eintragen:
+
+```json
+{"REFERENZPOSE_MODUS": "fest"}
+```
+
+Damit wird die Pose aus `REFERENZBILD` fuer alle Messbilder verwendet.
+Sofern Referenzmarker im Messbild sichtbar sind, werden diese weiterhin als
+Qualitaetskontrolle gegen die feste Referenzpose ausgewertet. Fehlen sie,
+findet im Offline-Modus keine entsprechende Kontrolle statt.
+
+Fuer das **Live-Addon** zusaetzlich in `live.config.local.json` eintragen:
+
+```json
+{
+  "REFERENZ_START": "bild",
+  "REFERENZ_KONTROLLE_IM_MESSBILD": false
+}
+```
+
+Das Live-Addon braucht dann keine sichtbaren Referenzmarker in den
+Messbildern mehr und verwendet die fest gespeicherte Pose. Die Anzeige meldet
+`FEST / UNGEPRUEFT`. **Jede Kamerabewegung seit dem Referenzbild ist in
+diesem Modus unerkannt moeglich.** Fokus, Bildausschnitt, Zoom, Kalibrierung
+und Aufloesung muessen identisch bleiben. Wer die Referenzmarker zur
+laufenden Qualitaetskontrolle im Bild hat, sollte die Live-Kontrolle
+`true` lassen.
+
