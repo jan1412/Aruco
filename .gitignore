@@ -51,3 +51,7 @@ diagnose_messserie.json
 model_comparison.json
 spatial_quality.json
 validation_spatial_quality.json
+
+# Lokale Live-Aufnahmen und Kamerakonfiguration
+live_aufnahmen/
+live.config.local.json
